@@ -5,7 +5,7 @@ import requests
 
 app = Flask(__name__)
 
-TOKEN = os.environ.get("BALE_TOKEN", "1903004953:wF6-iOo8Es7luHBHrM9YRp6_-JQB4q5SuUs")
+TOKEN = os.environ.get("BALE_TOKEN", "*******")
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 
 rooms = {}
@@ -24,7 +24,6 @@ def send_message(chat_id, text, reply_markup=None):
     except Exception as e:
         print(f"Error sending message: {e}")
 
-# تغییر مسیر وب‌هوک به یک آدرس ثابت و مشخص
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json()
@@ -54,17 +53,36 @@ def home():
 
 def handle_text(chat_id, user_id, user_name, text):
     global rooms
-    if text == "/start":
-        send_message(chat_id, "سلام کیا! خوش اومدی به ربات جرات حقیقت چندنفره.\nبرای شروع بازی در گروه، دستور `/newgame` رو بفرست.")
-    elif text == "/newgame":
+    
+    # دکمه ثابت پایین صفحه (Reply Keyboard)
+    reply_keyboard = {
+        "keyboard": [
+            [{"text": "🎮 ساخت بازی جدید"}, {"text": "👤 پیوستن به بازی"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+    if text == "/start" or text == "سلام":
+        send_message(chat_id, f"سلام کیا جان! خوش اومدی به ربات جرات حقیقت چندنفره.\nبرای شروع، از دکمه‌های پایین صفحه استفاده کن یا دستورات رو بفرست.", reply_markup=reply_keyboard)
+    
+    elif text == "🎮 ساخت بازی جدید" or text == "/newgame":
         rooms[chat_id] = {
             "players": [{"id": user_id, "name": user_name}],
             "state": "waiting_to_join",
             "turn_index": 0,
             "asker_index": 0
         }
-        send_message(chat_id, f"🎮 بازی جدید توسط **{user_name}** ساخته شد!\nبقیه بازیکن‌ها با دستور `/join` می‌تونن بیان تو بازی.\nوقتی همه اومدن، دستور `/startgame` رو بفرست.")
-    elif text == "/join":
+        # کیبورد برای پیوستن بقیه یا شروع بازی
+        game_keyboard = {
+            "keyboard": [
+                [{"text": "👤 پیوستن به بازی"}, {"text": "🚀 شروع بازی"}]
+            ],
+            "resize_keyboard": True
+        }
+        send_message(chat_id, f"🎮 بازی جدید توسط **{user_name}** ساخته شد!\nبقیه بازیکن‌ها روی «پیوستن به بازی» بزنن.\nوقتی همه اومدن، روی «شروع بازی» بزنید.", reply_markup=game_keyboard)
+    
+    elif text == "👤 پیوستن به بازی" or text == "/join":
         if chat_id in rooms and rooms[chat_id]["state"] == "waiting_to_join":
             player_ids = [p["id"] for p in rooms[chat_id]["players"]]
             if user_id not in player_ids:
@@ -72,7 +90,10 @@ def handle_text(chat_id, user_id, user_name, text):
                 send_message(chat_id, f"👤 **{user_name}** به بازی پیوست!")
             else:
                 send_message(chat_id, f"تو قبلاً وارد بازی شدی {user_name} جان!")
-    elif text == "/startgame":
+        else:
+            send_message(chat_id, "هنوز بازی جدیدی ساخته نشده! اول روی «ساخت بازی جدید» بزن.")
+            
+    elif text == "🚀 شروع بازی" or text == "/startgame":
         if chat_id in rooms and rooms[chat_id]["state"] == "waiting_to_join":
             if len(rooms[chat_id]["players"]) < 2:
                 send_message(chat_id, "حداقل باید ۲ نفر باشید!")
@@ -104,6 +125,8 @@ def start_new_round(chat_id):
         asker = room["players"][room["asker_index"]]
 
     room["sub_state"] = "choosing_jd"
+    
+    # کیبورد شیشه‌ای برای انتخاب جرات یا حقیقت
     keyboard = {
         "inline_keyboard": [
             [
