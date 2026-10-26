@@ -6,7 +6,7 @@ import requests
 app = Flask(__name__)
 
 # توکن ربات بله خودت رو اینجا بگذار یا از Environment Variables بگیر
-TOKEN = os.environ.get("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TOKEN = os.environ.get("TOKEN", "YOUR_BOT_TOKEN_HERE")
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 
 # ساختار ذخیره اتاق‌ها و وضعیت بازی‌ها (در حافظه)
