@@ -38,6 +38,15 @@ def send_message(chat_id, text, reply_markup=None):
         print(f"Error sending message: {e}")
 
 
+def send_photo(chat_id, photo_id, caption=""):
+    url = f"{BASE_URL}/sendPhoto"
+    payload = {"chat_id": chat_id, "photo": photo_id, "caption": caption, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Error sending photo: {e}")
+
+
 def main_keyboard():
     return {
         "keyboard": [[{"text": "🎮 ساخت اتاق جدید"}, {"text": "🚪 ورود به اتاق"}]],
@@ -73,7 +82,17 @@ def webhook():
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
         text = msg.get("text", "")
-        handle_text(chat_id, user_id, text)
+        
+        # بررسی اینکه آیا کاربر عکس فرستاده یا متن
+        photo_list = msg.get("photo")
+        photo_id = None
+        if photo_list:
+            # بله یا تلگرام آرایه‌ای از سایزهای مختلف عکس می‌فرستد؛ بزرگ‌ترین سایز آخرین آیتم است
+            photo_id = photo_list[-1].get("file_id")
+            caption = msg.get("caption", "")
+            handle_game_input(chat_id, user_id, text=caption, photo_id=photo_id)
+        else:
+            handle_text(chat_id, user_id, text)
 
     elif "callback_query" in update:
         query = update["callback_query"]
@@ -112,6 +131,10 @@ def handle_text(chat_id, user_id, text):
         else:
             pending_name[user_id] = True
             send_message(chat_id, "سلام! خوش اومدی به ربات جرات حقیقت چندنفره 🎮\n\nاول یه **اسم بازی** برای خودت انتخاب کن.\n⚠️ اسمت نباید تکراری باشه!\n\nاسم رو همینجا بفرست:")
+        return
+
+    # مدیریت ورودی‌های داخل بازی که متن ساده هستند
+    if handle_game_input(chat_id, user_id, text=text, photo_id=None):
         return
 
     name = profiles.get(user_id, {}).get("name", "بازیکن")
@@ -203,36 +226,49 @@ def handle_text(chat_id, user_id, text):
         send_message(chat_id, "تو توی هیچ اتاقی نیستی!")
         return
 
-    # ---------- پیام‌های داخل بازی (سوال و جواب) ----------
+
+def handle_game_input(chat_id, user_id, text, photo_id=None):
+    """مدیریت ارسال سوال یا پاسخ (متن یا عکس) در جریان بازی"""
     for code, room in rooms.items():
         if room["state"] == "playing":
-            # بررسی اینکه کاربر عضو این اتاق هست یا نه
             if not any(p["id"] == user_id for p in room["players"]):
                 continue
 
             target = room["players"][room["turn_index"]]
             asker = room["players"][room["asker_index"]]
 
-            # ۱. اگر نوبت پرسشگر است که سوال بفرستد
+            # ۱. ارسال سوال توسط پرسشگر
             if user_id == asker["id"] and room.get("sub_state") == "waiting_for_question":
-                room["sub_state"] = "waiting_for_answer"
-                choice_label = room.get("last_choice", "سوال")
-                
-                # ارسال سوال به بازیکن هدف و بقیه اعضا
-                for p in room["players"]:
-                    send_message(p["id"], f"❓ **سوال ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n\n_{text}_\n\n👉 **{target['name']}**، حالا جواب خودت رو بفرست:")
-                return
+                if photo_id:
+                    # سوال به صورت عکس فرستاده شده
+                    room["sub_state"] = "waiting_for_answer"
+                    choice_label = room.get("last_choice", "سوال")
+                    for p in room["players"]:
+                        send_photo(p["id"], photo_id, caption=f"❓ **سوال تصویری ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n_{text}_\n\n👉 **{target['name']}**، حالا جواب یا عکس انجام جرات رو بفرست:")
+                    return True
+                elif text:
+                    room["sub_state"] = "waiting_for_answer"
+                    choice_label = room.get("last_choice", "سوال")
+                    for p in room["players"]:
+                        send_message(p["id"], f"❓ **سوال ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n\n_{text}_\n\n👉 **{target['name']}**، حالا جواب خودت رو بفرست:")
+                    return True
 
-            # ۲. اگر نوبت بازیکن هدف است که جواب بدهد
+            # ۲. ارسال پاسخ (متن یا عکس) توسط بازیکن هدف
             if user_id == target["id"] and room.get("sub_state") == "waiting_for_answer":
-                for p in room["players"]:
-                    send_message(p["id"], f"💬 **پاسخ {target['name']}:**\n\n_{text}_\n\n✨ این راند تمام شد! بریم راند بعدی...")
+                if photo_id:
+                    for p in room["players"]:
+                        send_photo(p["id"], photo_id, caption=f"📸 **تصویر انجام جرات توسط {target['name']}:**\n_{text}_\n\n✨ این راند تمام شد! بریم راند بعدی...")
+                else:
+                    for p in room["players"]:
+                        send_message(p["id"], f"💬 **پاسخ {target['name']}:**\n\n_{text}_\n\n✨ این راند تمام شد! بریم راند بعدی...")
                 
                 # رفتن به راند بعد
                 room["turn_index"] = (room["turn_index"] + 1) % len(room["players"])
                 room["asker_index"] = (room["asker_index"] + 1) % len(room["players"])
                 start_new_round(code)
-                return
+                return True
+
+    return False
 
 
 def start_new_round(code):
@@ -267,14 +303,14 @@ def handle_callback(chat_id, user_id, data):
                 send_message(chat_id, f"تو الان توی اتاق `{c}` هستی!")
                 return
 
-        if code in rooms and rooms[code]["state"] == "waiting":
-            room = rooms[code]
-            room["players"].append({"id": user_id, "name": name})
-            send_message(chat_id, f"👤 **{name}** وارد اتاق `{code}` شد! ({len(room['players'])} نفر)", reply_markup=room_guest_keyboard())
-            send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
-        else:
-            send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بازی‌اش شروع شده است!")
-        return
+            if code in rooms and rooms[code]["state"] == "waiting":
+                room = rooms[code]
+                room["players"].append({"id": user_id, "name": name})
+                send_message(chat_id, f"👤 **{name}** وارد اتاق `{code}` شد! ({len(room['players'])} نفر)", reply_markup=room_guest_keyboard())
+                send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
+            else:
+                send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بازی‌اش شروع شده است!")
+            return
 
     # ---------- انتخاب جرات یا حقیقت داخل بازی ----------
     for code, room in rooms.items():
@@ -288,7 +324,7 @@ def handle_callback(chat_id, user_id, data):
                 
                 for p in room["players"]:
                     send_message(p["id"],
-                        f"🔔 **{target['name']}** گزینه **{choice_text}** رو انتخاب کرد!\n\n✍️ حالا **{asker['name']}** باید سوالش رو برای **{target['name']}** بفرسته:")
+                        f"🔔 **{target['name']}** گزینه **{choice_text}** رو انتخاب کرد!\n\n✍️ حالا **{asker['name']}** باید سوال یا چالش خودش رو برای **{target['name']}** بفرسته:")
                 return
 
 
