@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import string
 from flask import Flask, request, jsonify
@@ -9,14 +10,38 @@ app = Flask(__name__)
 TOKEN = os.environ.get("BALE_TOKEN", "*******")
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 
-# پروفایل بازیکن‌ها: {user_id: {"name": str}}
-profiles = {}
+DB_FILE = "database.json"
 
-# وضعیت ثبت‌نام: {user_id: True}
-pending_name = {}
+def load_data():
+    """بارگذاری اطلاعات از فایل JSON"""
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading DB: {e}")
+    return {"profiles": {}, "pending_name": {}, "rooms": {}}
 
-# اتاق‌ها: {room_code: {...}}
-rooms = {}
+def save_data(data):
+    """ذخیره اطلاعات در فایل JSON"""
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Error saving DB: {e}")
+
+# بارگذاری اولیه داده‌ها
+db = load_data()
+profiles = db.get("profiles", {})
+pending_name = db.get("pending_name", {})
+rooms = db.get("rooms", {})
+
+def commit():
+    """تابع کمکی برای ذخیره خودکار تغییرات"""
+    db["profiles"] = profiles
+    db["pending_name"] = pending_name
+    db["rooms"] = rooms
+    save_data(db)
 
 
 def gen_code():
@@ -80,14 +105,12 @@ def webhook():
     if "message" in update:
         msg = update["message"]
         chat_id = msg["chat"]["id"]
-        user_id = msg["from"]["id"]
+        user_id = str(msg["from"]["id"])  # کلیدهای دیکشنری در JSON رشته هستند
         text = msg.get("text", "")
         
-        # بررسی اینکه آیا کاربر عکس فرستاده یا متن
         photo_list = msg.get("photo")
         photo_id = None
         if photo_list:
-            # بله یا تلگرام آرایه‌ای از سایزهای مختلف عکس می‌فرستد؛ بزرگ‌ترین سایز آخرین آیتم است
             photo_id = photo_list[-1].get("file_id")
             caption = msg.get("caption", "")
             handle_game_input(chat_id, user_id, text=caption, photo_id=photo_id)
@@ -97,7 +120,7 @@ def webhook():
     elif "callback_query" in update:
         query = update["callback_query"]
         chat_id = query["message"]["chat"]["id"]
-        user_id = query["from"]["id"]
+        user_id = str(query["from"]["id"])
         data = query["data"]
         handle_callback(chat_id, user_id, data)
 
@@ -121,6 +144,7 @@ def handle_text(chat_id, user_id, text):
             return
         profiles[user_id] = {"name": name}
         del pending_name[user_id]
+        commit()
         send_message(chat_id, f"✅ خوش اومدی **{name}** جان!\nحالا می‌تونی اتاق بسازی یا به اتاق‌ها بپیوندی.", reply_markup=main_keyboard())
         return
 
@@ -130,10 +154,10 @@ def handle_text(chat_id, user_id, text):
             send_message(chat_id, f"سلام **{profiles[user_id]['name']}** جان! 👋", reply_markup=main_keyboard())
         else:
             pending_name[user_id] = True
+            commit()
             send_message(chat_id, "سلام! خوش اومدی به ربات جرات حقیقت چندنفره 🎮\n\nاول یه **اسم بازی** برای خودت انتخاب کن.\n⚠️ اسمت نباید تکراری باشه!\n\nاسم رو همینجا بفرست:")
         return
 
-    # مدیریت ورودی‌های داخل بازی که متن ساده هستند
     if handle_game_input(chat_id, user_id, text=text, photo_id=None):
         return
 
@@ -154,6 +178,7 @@ def handle_text(chat_id, user_id, text):
             "asker_index": 0,
             "sub_state": None
         }
+        commit()
         send_message(chat_id,
             f"🎮 اتاق ساخته شد!\n\n📌 **کد اتاق:** `{code}`\n👑 میزبان: **{name}**\n\nبا دکمه «ورود به اتاق» بقیه می‌تونن لیست رو ببینن و بیان.\nوقتی همه جمع شدن، روی «🚀 شروع بازی» بزن.",
             reply_markup=room_host_keyboard())
@@ -190,6 +215,7 @@ def handle_text(chat_id, user_id, text):
                     if p["id"] != user_id:
                         send_message(p["id"], f"🗑 اتاق `{code}` توسط میزبان حذف شد.", reply_markup=main_keyboard())
                 del rooms[code]
+                commit()
                 send_message(chat_id, f"🗑 اتاق `{code}` با موفقیت حذف شد.", reply_markup=main_keyboard())
                 return
         send_message(chat_id, "تو میزبان هیچ اتاقی نیستی!")
@@ -203,6 +229,7 @@ def handle_text(chat_id, user_id, text):
                     send_message(chat_id, "حداقل باید ۲ نفر توی اتاق باشین!")
                     return
                 room["state"] = "playing"
+                commit()
                 send_message(chat_id, f"🚀 بازی توی اتاق `{code}` شروع شد!")
                 start_new_round(code)
                 return
@@ -215,20 +242,20 @@ def handle_text(chat_id, user_id, text):
             for p in room["players"]:
                 if p["id"] == user_id:
                     room["players"].remove(p)
-                    send_message(chat_id, f"از اتاق `{code}` خارج شدی.", reply_markup=main_keyboard())
                     if room["host_id"] == user_id:
                         for q in room["players"]:
                             send_message(q["id"], f"🗑 میزبان اتاق `{code}` خارج شد و اتاق حذف شد.", reply_markup=main_keyboard())
                         del rooms[code]
                     else:
                         send_message(room["host_id"], f"👋 **{p['name']}** اتاق رو ترک کرد. ({len(room['players'])} نفر)")
+                    commit()
+                    send_message(chat_id, f"از اتاق `{code}` خارج شدی.", reply_markup=main_keyboard())
                     return
         send_message(chat_id, "تو توی هیچ اتاقی نیستی!")
         return
 
 
 def handle_game_input(chat_id, user_id, text, photo_id=None):
-    """مدیریت ارسال سوال یا پاسخ (متن یا عکس) در جریان بازی"""
     for code, room in rooms.items():
         if room["state"] == "playing":
             if not any(p["id"] == user_id for p in room["players"]):
@@ -240,20 +267,21 @@ def handle_game_input(chat_id, user_id, text, photo_id=None):
             # ۱. ارسال سوال توسط پرسشگر
             if user_id == asker["id"] and room.get("sub_state") == "waiting_for_question":
                 if photo_id:
-                    # سوال به صورت عکس فرستاده شده
                     room["sub_state"] = "waiting_for_answer"
+                    commit()
                     choice_label = room.get("last_choice", "سوال")
                     for p in room["players"]:
                         send_photo(p["id"], photo_id, caption=f"❓ **سوال تصویری ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n_{text}_\n\n👉 **{target['name']}**، حالا جواب یا عکس انجام جرات رو بفرست:")
                     return True
                 elif text:
                     room["sub_state"] = "waiting_for_answer"
+                    commit()
                     choice_label = room.get("last_choice", "سوال")
                     for p in room["players"]:
                         send_message(p["id"], f"❓ **سوال ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n\n_{text}_\n\n👉 **{target['name']}**، حالا جواب خودت رو بفرست:")
                     return True
 
-            # ۲. ارسال پاسخ (متن یا عکس) توسط بازیکن هدف
+            # ۲. ارسال پاسخ توسط بازیکن هدف
             if user_id == target["id"] and room.get("sub_state") == "waiting_for_answer":
                 if photo_id:
                     for p in room["players"]:
@@ -262,9 +290,9 @@ def handle_game_input(chat_id, user_id, text, photo_id=None):
                     for p in room["players"]:
                         send_message(p["id"], f"💬 **پاسخ {target['name']}:**\n\n_{text}_\n\n✨ این راند تمام شد! بریم راند بعدی...")
                 
-                # رفتن به راند بعد
                 room["turn_index"] = (room["turn_index"] + 1) % len(room["players"])
                 room["asker_index"] = (room["asker_index"] + 1) % len(room["players"])
+                commit()
                 start_new_round(code)
                 return True
 
@@ -280,6 +308,8 @@ def start_new_round(code):
         asker = room["players"][room["asker_index"]]
 
     room["sub_state"] = "choosing_jd"
+    commit()
+    
     keyboard = {
         "inline_keyboard": [
             [{"text": "🤫 حقیقت", "callback_data": "truth"},
@@ -293,7 +323,6 @@ def start_new_round(code):
 
 
 def handle_callback(chat_id, user_id, data):
-    # ---------- کلیک روی دکمه ورود به اتاق ----------
     if data.startswith("join_"):
         code = data.split("_")[1]
         name = profiles.get(user_id, {}).get("name", "بازیکن")
@@ -303,16 +332,16 @@ def handle_callback(chat_id, user_id, data):
                 send_message(chat_id, f"تو الان توی اتاق `{c}` هستی!")
                 return
 
-            if code in rooms and rooms[code]["state"] == "waiting":
-                room = rooms[code]
-                room["players"].append({"id": user_id, "name": name})
-                send_message(chat_id, f"👤 **{name}** وارد اتاق `{code}` شد! ({len(room['players'])} نفر)", reply_markup=room_guest_keyboard())
-                send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
-            else:
-                send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بازی‌اش شروع شده است!")
-            return
+        if code in rooms and rooms[code]["state"] == "waiting":
+            room = rooms[code]
+            room["players"].append({"id": user_id, "name": name})
+            commit()
+            send_message(chat_id, f"👤 **{name}** وارد اتاق `{code}` شد! ({len(room['players'])} نفر)", reply_markup=room_guest_keyboard())
+            send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
+        else:
+            send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بازی‌اش شروع شده است!")
+        return
 
-    # ---------- انتخاب جرات یا حقیقت داخل بازی ----------
     for code, room in rooms.items():
         if room["state"] == "playing":
             target = room["players"][room["turn_index"]]
@@ -321,6 +350,7 @@ def handle_callback(chat_id, user_id, data):
                 room["last_choice"] = choice_text
                 asker = room["players"][room["asker_index"]]
                 room["sub_state"] = "waiting_for_question"
+                commit()
                 
                 for p in room["players"]:
                     send_message(p["id"],
