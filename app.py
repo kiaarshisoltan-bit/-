@@ -14,7 +14,7 @@ BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 # آدرس وب‌سرور خودتون روی رندر (برای تکنیک بیدار نگه داشتن)
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://jorat-bot.onrender.com")
 
-# متغیرهای حافظه (دیگه پاک نمیشن چون بات همیشه بیدار می‌مونه!)
+# متغیرهای حافظه
 profiles = {}
 pending_name = {}
 rooms = {}
@@ -63,7 +63,10 @@ def send_photo(chat_id, photo_id, caption=""):
 
 def main_keyboard():
     return {
-        "keyboard": [[{"text": "🎮 ساخت اتاق جدید"}, {"text": "🚪 ورود به اتاق"}]],
+        "keyboard": [
+            [{"text": "🎮 ساخت اتاق جدید"}, {"text": "🚪 ورود به اتاق"}],
+            [{"text": "📢 پشتیبانی، ایده و نظرات"}]
+        ],
         "resize_keyboard": True
     }
 
@@ -72,7 +75,8 @@ def room_host_keyboard():
     return {
         "keyboard": [
             [{"text": "🚀 شروع بازی"}],
-            [{"text": "🗑 حذف اتاق"}]
+            [{"text": "🗑 حذف اتاق"}],
+            [{"text": "📢 پشتیبانی، ایده و نظرات"}]
         ],
         "resize_keyboard": True
     }
@@ -80,7 +84,10 @@ def room_host_keyboard():
 
 def room_guest_keyboard():
     return {
-        "keyboard": [[{"text": "🚪 خروج از اتاق"}]],
+        "keyboard": [
+            [{"text": "🚪 خروج از اتاق"}],
+            [{"text": "📢 پشتیبانی، ایده و نظرات"}]
+        ],
         "resize_keyboard": True
     }
 
@@ -122,6 +129,12 @@ def home():
 
 
 def handle_text(chat_id, user_id, text):
+    # ---------- دکمه پشتیبانی و نظرات ----------
+    if text == "📢 پشتیبانی، ایده و نظرات":
+        send_message(chat_id, 
+            "💡 **ارسال ایده، گزارش مشکل و نظرات:**\n\nاگر باگ یا مشکلی دیدین، یا ایده‌ای برای بهتر شدن ربات دارید، می‌تونید به سازنده ربات پیام بدید:\n\n📩 آیدی ارتباطی: `@KIA_karfarma`")
+        return
+
     # ---------- مرحله انتخاب اسم ----------
     if user_id in pending_name:
         name = text.strip()
