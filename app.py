@@ -11,30 +11,49 @@ app = Flask(__name__)
 TOKEN = os.environ.get("BALE_TOKEN", "*******")
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 
-# آدرس وب‌سرور خودتون روی رندر (برای تکنیک بیدار نگه داشتن)
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://jorat-bot.onrender.com")
 
 # متغیرهای حافظه
 profiles = {}
 pending_name = {}
 rooms = {}
+single_player = {}  # ذخیره وضعیت بازی تک‌نفره کاربران
+
+# بانک سوالات و چالش‌های تک‌نفره پیش‌فرض ربات
+BOT_TRUTHS = [
+    "بزرگترین گند زندگیت چی بوده که هنوز کسی نفهمیده؟ 😂",
+    "اگه مجبور باشی بینگ و یاهو رو برای همیشه حذف کنی کدومو انتخاب می‌کنی؟",
+    "تا حالا شده چیزی رو از مغازه کش بری؟ چی بوده؟ 🤨",
+    "خجالت‌آورترین خاطره دوران مدرسه‌ت چی بوده؟",
+    "اگه غیب بشی، اولین جایی که میری کجاست و چیکار می‌کنی؟",
+    "تا حالا توی اتاق در بسته با خودت حرف زدی و رقصیدی؟ 🕺",
+    "آخرین دروغ بزرگی که گفتی چی بوده و به کی گفتی؟"
+]
+
+BOT_DARES = [
+    "📷 یک عکس از سقف اتاقت همین الان بگیر و بفرست!",
+    "💬 یک ویس بفرست و توش مثل اردک صحبت کن! 🦆",
+    "😂 خنده‌دارترین عکسی که توی گوشیت داری رو همین الان بفرست.",
+    "✍️ توی یک پیام، ۳ تا از عجیب‌ترین عادت‌هات رو بنویس.",
+    "📱 اسم آخرین کسی که بهش پیام دادی رو بگو و بگو آخرین چت‌تون چی بوده.",
+    "🕺 یک ویدیو یا عکس از خودت وقتی داری ادا یک ربات رو درمیاری بفرست!"
+]
+
 
 def keep_alive():
     """هر ۴ دقیقه یک‌بار به ربات خودش درخواست می‌فرسته تا خوابش نبره"""
     while True:
         try:
-            time.sleep(240)  # ۲۴۰ ثانیه = ۴ دقیقه
+            time.sleep(240)
             requests.get(RENDER_URL)
             print("Self-ping sent to keep bot awake!")
         except Exception as e:
             print(f"Keep-alive error: {e}")
 
-# استارت کردن ترد بیدارباش در پشت صحنه
 threading.Thread(target=keep_alive, daemon=True).start()
 
 
 def gen_code():
-    """تولید کد ۴ حرفی یکتا برای اتاق"""
     while True:
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
         if code not in rooms:
@@ -65,6 +84,7 @@ def main_keyboard():
     return {
         "keyboard": [
             [{"text": "🎮 ساخت اتاق جدید"}, {"text": "🚪 ورود به اتاق"}],
+            [{"text": "🤖 بازی تک‌نفره (با ربات)"}],
             [{"text": "📢 پشتیبانی، ایده و نظرات"}]
         ],
         "resize_keyboard": True
@@ -129,13 +149,12 @@ def home():
 
 
 def handle_text(chat_id, user_id, text):
-    # ---------- دکمه پشتیبانی و نظرات ----------
     if text == "📢 پشتیبانی، ایده و نظرات":
         send_message(chat_id, 
             "💡 **ارسال ایده، گزارش مشکل و نظرات:**\n\nاگر باگ یا مشکلی دیدین، یا ایده‌ای برای بهتر شدن ربات دارید، می‌تونید به سازنده ربات پیام بدید:\n\n📩 آیدی ارتباطی: `@KIA_karfarma`")
         return
 
-    # ---------- مرحله انتخاب اسم ----------
+    # مدیریت ثبت نام
     if user_id in pending_name:
         name = text.strip()
         if len(name) < 2:
@@ -146,22 +165,45 @@ def handle_text(chat_id, user_id, text):
             return
         profiles[user_id] = {"name": name}
         del pending_name[user_id]
-        send_message(chat_id, f"✅ خوش اومدی **{name}** جان!\nحالا می‌تونی اتاق بسازی یا به اتاق‌ها بپیوندی.", reply_markup=main_keyboard())
+        send_message(chat_id, f"✅ خوش اومدی **{name}** جان!\nحالا می‌تونی اتاق بسازی، به اتاق‌ها بپیوندی یا با ربات تک‌نفره بازی کنی.", reply_markup=main_keyboard())
         return
 
-    # ---------- شروع / ثبت‌نام ----------
     if text == "/start":
         if user_id in profiles:
             send_message(chat_id, f"سلام **{profiles[user_id]['name']}** جان! 👋", reply_markup=main_keyboard())
         else:
             pending_name[user_id] = True
-            send_message(chat_id, "سلام! خوش اومدی به ربات جرات حقیقت چندنفره 🎮\n\nاول یه **اسم بازی** برای خودت انتخاب کن.\n⚠️ اسمت نباید تکراری باشه!\n\nاسم رو همینجا بفرست:")
+            send_message(chat_id, "سلام! خوش اومدی به ربات جرات حقیقت چندنفره و تک‌نفره 🎮\n\nاول یه **اسم بازی** برای خودت انتخاب کن.\n⚠️ اسمت نباید تکراری باشه!\n\nاسم رو همینجا بفرست:")
+        return
+
+    # بررسی ورودی بازی تک نفره
+    if user_id in single_player and single_player[user_id].get("state") == "waiting_for_answer":
+        photo_id = None
+        if "photo" in text.lower(): # اگر عکس فرستاد
+            pass
+        send_message(chat_id, "✨ عالی بود! چه جواب خفنی دستی دادی. 😎\nمی‌خوای بازم با ربات بازی کنی یا برگردی منو؟", reply_markup={
+            "inline_keyboard": [
+                [{"text": "🔄 راند بعدی با ربات", "callback_data": "sp_again"},
+                 {"text": "🏠 بازگشت به منوی اصلی", "callback_data": "sp_menu"}]
+            ]
+        })
+        del single_player[user_id]
         return
 
     if handle_game_input(chat_id, user_id, text=text, photo_id=None):
         return
 
-    name = profiles.get(user_id, {}).get("name", "بازیکن")
+    # ---------- بازی تک‌نفره با ربات ----------
+    if text == "🤖 بازی تک‌نفره (با ربات)":
+        single_player[user_id] = {"state": "choosing"}
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🤫 حقیقت (با ربات)", "callback_data": "sp_truth"},
+                 {"text": "😈 جرات (با ربات)", "callback_data": "sp_dare"}]
+            ]
+        }
+        send_message(chat_id, "🤖 بخش بازی تک‌نفره با ربات!\n\nمن حریف تمرینی تو هستم. می‌خوای حقیقت رو انتخاب کنی یا جرات؟", reply_markup=keyboard)
+        return
 
     # ---------- ساخت اتاق ----------
     if text == "🎮 ساخت اتاق جدید":
@@ -170,6 +212,7 @@ def handle_text(chat_id, user_id, text):
                 send_message(chat_id, f"تو الان توی اتاق `{code}` هستی! اول ازش خارج شو.")
                 return
         code = gen_code()
+        name = profiles.get(user_id, {}).get("name", "بازیکن")
         rooms[code] = {
             "host_id": user_id,
             "players": [{"id": user_id, "name": name}],
@@ -183,7 +226,7 @@ def handle_text(chat_id, user_id, text):
             reply_markup=room_host_keyboard())
         return
 
-    # ---------- ورود به اتاق (نمایش لیست شیشه‌ای) ----------
+    # ---------- ورود به اتاق ----------
     if text == "🚪 ورود به اتاق":
         for code, room in list(rooms.items()):
             if any(p["id"] == user_id for p in room["players"]):
@@ -192,7 +235,7 @@ def handle_text(chat_id, user_id, text):
         
         waiting_rooms = {code: room for code, room in rooms.items() if room["state"] == "waiting"}
         if not waiting_rooms:
-            send_message(chat_id, "❌ هیچ اتاق بازی‌ای در حال انتظار نیست! می‌تونی خودت یکی بسازی.")
+            send_message(chat_id, "❌ هیچ اتاق بازی‌ای در حال انتظار نیست! می‌تونی خودت یکی بسازی یا با ربات تک‌نفره بازی کنی.")
             return
 
         inline_buttons = []
@@ -224,7 +267,7 @@ def handle_text(chat_id, user_id, text):
         for code, room in rooms.items():
             if room["host_id"] == user_id and room["state"] == "waiting":
                 if len(room["players"]) < 2:
-                    send_message(chat_id, "حداقل باید ۲ نفر توی اتاق باشین!")
+                    send_message(chat_id, "حداقل باید ۲ نفر توی اتاق باشین! (اگه تنهائی می‌تونی از بخش تک‌نفره با ربات استفاده کنی)")
                     return
                 room["state"] = "playing"
                 send_message(chat_id, f"🚀 بازی توی اتاق `{code}` شروع شد!")
@@ -260,7 +303,6 @@ def handle_game_input(chat_id, user_id, text, photo_id=None):
             target = room["players"][room["turn_index"]]
             asker = room["players"][room["asker_index"]]
 
-            # ۱. ارسال سوال توسط پرسشگر
             if user_id == asker["id"] and room.get("sub_state") == "waiting_for_question":
                 if photo_id:
                     room["sub_state"] = "waiting_for_answer"
@@ -275,7 +317,6 @@ def handle_game_input(chat_id, user_id, text, photo_id=None):
                         send_message(p["id"], f"❓ **سوال ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n\n_{text}_\n\n👉 **{target['name']}**، حالا جواب خودت رو بفرست:")
                     return True
 
-            # ۲. ارسال پاسخ توسط بازیکن هدف
             if user_id == target["id"] and room.get("sub_state") == "waiting_for_answer":
                 if photo_id:
                     for p in room["players"]:
@@ -315,6 +356,33 @@ def start_new_round(code):
 
 
 def handle_callback(chat_id, user_id, data):
+    # مدیریت کال‌بک‌های بازی تک‌نفره
+    if data == "sp_truth":
+        q = random.choice(BOT_TRUTHS)
+        single_player[user_id] = {"state": "waiting_for_answer"}
+        send_message(chat_id, f"🤖 **حقیقت ربات برای تو:**\n\n_{q}_\n\n✍️ حالا جواب خودت رو برام بفرست:")
+        return
+    elif data == "sp_dare":
+        d = random.choice(BOT_DARES)
+        single_player[user_id] = {"state": "waiting_for_answer"}
+        send_message(chat_id, f"🤖 **جرات ربات برای تو:**\n\n_{d}_\n\n👉 وقتی انجامش دادی، متن یا عکسش رو برام بفرست:")
+        return
+    elif data == "sp_again":
+        single_player[user_id] = {"state": "choosing"}
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🤫 حقیقت (با ربات)", "callback_data": "sp_truth"},
+                 {"text": "😈 جرات (با ربات)", "callback_data": "sp_dare"}]
+            ]
+        }
+        send_message(chat_id, "دوباره انتخاب کن! حقیقت یا جرات؟", reply_markup=keyboard)
+        return
+    elif data == "sp_menu":
+        if user_id in single_player:
+            del single_player[user_id]
+        send_message(chat_id, "به منوی اصلی برگشتی.", reply_markup=main_keyboard())
+        return
+
     if data.startswith("join_"):
         code = data.split("_")[1]
         name = profiles.get(user_id, {}).get("name", "بازیکن")
