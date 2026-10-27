@@ -1,7 +1,8 @@
 import os
-import json
 import random
 import string
+import threading
+import time
 from flask import Flask, request, jsonify
 import requests
 
@@ -10,38 +11,26 @@ app = Flask(__name__)
 TOKEN = os.environ.get("BALE_TOKEN", "*******")
 BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 
-DB_FILE = "database.json"
+# آدرس وب‌سرور خودتون روی رندر (برای تکنیک بیدار نگه داشتن)
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://jorat-bot.onrender.com")
 
-def load_data():
-    """بارگذاری اطلاعات از فایل JSON"""
-    if os.path.exists(DB_FILE):
+# متغیرهای حافظه (دیگه پاک نمیشن چون بات همیشه بیدار می‌مونه!)
+profiles = {}
+pending_name = {}
+rooms = {}
+
+def keep_alive():
+    """هر ۴ دقیقه یک‌بار به ربات خودش درخواست می‌فرسته تا خوابش نبره"""
+    while True:
         try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            time.sleep(240)  # ۲۴۰ ثانیه = ۴ دقیقه
+            requests.get(RENDER_URL)
+            print("Self-ping sent to keep bot awake!")
         except Exception as e:
-            print(f"Error loading DB: {e}")
-    return {"profiles": {}, "pending_name": {}, "rooms": {}}
+            print(f"Keep-alive error: {e}")
 
-def save_data(data):
-    """ذخیره اطلاعات در فایل JSON"""
-    try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"Error saving DB: {e}")
-
-# بارگذاری اولیه داده‌ها
-db = load_data()
-profiles = db.get("profiles", {})
-pending_name = db.get("pending_name", {})
-rooms = db.get("rooms", {})
-
-def commit():
-    """تابع کمکی برای ذخیره خودکار تغییرات"""
-    db["profiles"] = profiles
-    db["pending_name"] = pending_name
-    db["rooms"] = rooms
-    save_data(db)
+# استارت کردن ترد بیدارباش در پشت صحنه
+threading.Thread(target=keep_alive, daemon=True).start()
 
 
 def gen_code():
@@ -105,7 +94,7 @@ def webhook():
     if "message" in update:
         msg = update["message"]
         chat_id = msg["chat"]["id"]
-        user_id = str(msg["from"]["id"])  # کلیدهای دیکشنری در JSON رشته هستند
+        user_id = msg["from"]["id"]
         text = msg.get("text", "")
         
         photo_list = msg.get("photo")
@@ -120,7 +109,7 @@ def webhook():
     elif "callback_query" in update:
         query = update["callback_query"]
         chat_id = query["message"]["chat"]["id"]
-        user_id = str(query["from"]["id"])
+        user_id = query["from"]["id"]
         data = query["data"]
         handle_callback(chat_id, user_id, data)
 
@@ -144,7 +133,6 @@ def handle_text(chat_id, user_id, text):
             return
         profiles[user_id] = {"name": name}
         del pending_name[user_id]
-        commit()
         send_message(chat_id, f"✅ خوش اومدی **{name}** جان!\nحالا می‌تونی اتاق بسازی یا به اتاق‌ها بپیوندی.", reply_markup=main_keyboard())
         return
 
@@ -154,7 +142,6 @@ def handle_text(chat_id, user_id, text):
             send_message(chat_id, f"سلام **{profiles[user_id]['name']}** جان! 👋", reply_markup=main_keyboard())
         else:
             pending_name[user_id] = True
-            commit()
             send_message(chat_id, "سلام! خوش اومدی به ربات جرات حقیقت چندنفره 🎮\n\nاول یه **اسم بازی** برای خودت انتخاب کن.\n⚠️ اسمت نباید تکراری باشه!\n\nاسم رو همینجا بفرست:")
         return
 
@@ -178,7 +165,6 @@ def handle_text(chat_id, user_id, text):
             "asker_index": 0,
             "sub_state": None
         }
-        commit()
         send_message(chat_id,
             f"🎮 اتاق ساخته شد!\n\n📌 **کد اتاق:** `{code}`\n👑 میزبان: **{name}**\n\nبا دکمه «ورود به اتاق» بقیه می‌تونن لیست رو ببینن و بیان.\nوقتی همه جمع شدن، روی «🚀 شروع بازی» بزن.",
             reply_markup=room_host_keyboard())
@@ -215,7 +201,6 @@ def handle_text(chat_id, user_id, text):
                     if p["id"] != user_id:
                         send_message(p["id"], f"🗑 اتاق `{code}` توسط میزبان حذف شد.", reply_markup=main_keyboard())
                 del rooms[code]
-                commit()
                 send_message(chat_id, f"🗑 اتاق `{code}` با موفقیت حذف شد.", reply_markup=main_keyboard())
                 return
         send_message(chat_id, "تو میزبان هیچ اتاقی نیستی!")
@@ -229,7 +214,6 @@ def handle_text(chat_id, user_id, text):
                     send_message(chat_id, "حداقل باید ۲ نفر توی اتاق باشین!")
                     return
                 room["state"] = "playing"
-                commit()
                 send_message(chat_id, f"🚀 بازی توی اتاق `{code}` شروع شد!")
                 start_new_round(code)
                 return
@@ -248,7 +232,6 @@ def handle_text(chat_id, user_id, text):
                         del rooms[code]
                     else:
                         send_message(room["host_id"], f"👋 **{p['name']}** اتاق رو ترک کرد. ({len(room['players'])} نفر)")
-                    commit()
                     send_message(chat_id, f"از اتاق `{code}` خارج شدی.", reply_markup=main_keyboard())
                     return
         send_message(chat_id, "تو توی هیچ اتاقی نیستی!")
@@ -268,14 +251,12 @@ def handle_game_input(chat_id, user_id, text, photo_id=None):
             if user_id == asker["id"] and room.get("sub_state") == "waiting_for_question":
                 if photo_id:
                     room["sub_state"] = "waiting_for_answer"
-                    commit()
                     choice_label = room.get("last_choice", "سوال")
                     for p in room["players"]:
                         send_photo(p["id"], photo_id, caption=f"❓ **سوال تصویری ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n_{text}_\n\n👉 **{target['name']}**، حالا جواب یا عکس انجام جرات رو بفرست:")
                     return True
                 elif text:
                     room["sub_state"] = "waiting_for_answer"
-                    commit()
                     choice_label = room.get("last_choice", "سوال")
                     for p in room["players"]:
                         send_message(p["id"], f"❓ **سوال ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n\n_{text}_\n\n👉 **{target['name']}**، حالا جواب خودت رو بفرست:")
@@ -292,7 +273,6 @@ def handle_game_input(chat_id, user_id, text, photo_id=None):
                 
                 room["turn_index"] = (room["turn_index"] + 1) % len(room["players"])
                 room["asker_index"] = (room["asker_index"] + 1) % len(room["players"])
-                commit()
                 start_new_round(code)
                 return True
 
@@ -308,7 +288,6 @@ def start_new_round(code):
         asker = room["players"][room["asker_index"]]
 
     room["sub_state"] = "choosing_jd"
-    commit()
     
     keyboard = {
         "inline_keyboard": [
@@ -335,7 +314,6 @@ def handle_callback(chat_id, user_id, data):
         if code in rooms and rooms[code]["state"] == "waiting":
             room = rooms[code]
             room["players"].append({"id": user_id, "name": name})
-            commit()
             send_message(chat_id, f"👤 **{name}** وارد اتاق `{code}` شد! ({len(room['players'])} نفر)", reply_markup=room_guest_keyboard())
             send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
         else:
@@ -350,7 +328,6 @@ def handle_callback(chat_id, user_id, data):
                 room["last_choice"] = choice_text
                 asker = room["players"][room["asker_index"]]
                 room["sub_state"] = "waiting_for_question"
-                commit()
                 
                 for p in room["players"]:
                     send_message(p["id"],
