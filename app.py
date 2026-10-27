@@ -12,7 +12,7 @@ BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 # پروفایل بازیکن‌ها: {user_id: {"name": str}}
 profiles = {}
 
-# وضعیت ثبت‌نام: {user_id: "waiting_for_name"}
+# وضعیت ثبت‌نام: {user_id: True}
 pending_name = {}
 
 # اتاق‌ها: {room_code: {...}}
@@ -118,7 +118,6 @@ def handle_text(chat_id, user_id, text):
 
     # ---------- ساخت اتاق ----------
     if text == "🎮 ساخت اتاق جدید":
-        # اگه کاربر توی اتاق دیگه‌ای هست
         for code, room in list(rooms.items()):
             if any(p["id"] == user_id for p in room["players"]):
                 send_message(chat_id, f"تو الان توی اتاق `{code}` هستی! اول ازش خارج شو.")
@@ -133,45 +132,39 @@ def handle_text(chat_id, user_id, text):
             "sub_state": None
         }
         send_message(chat_id,
-            f"🎮 اتاق ساخته شد!\n\n📌 **کد اتاق:** `{code}`\n👑 میزبان: **{name}**\n\nاین کد رو به دوستات بده تا با گزینه «🚪 ورود به اتاق» بیان تو.\nوقتی همه جمع شدن، روی «🚀 شروع بازی» بزن.",
+            f"🎮 اتاق ساخته شد!\n\n📌 **کد اتاق:** `{code}`\n👑 میزبان: **{name}**\n\nبا دکمه «ورود به اتاق» بقیه می‌تونن لیست رو ببینن و بیان.\nوقتی همه جمع شدن، روی «🚀 شروع بازی» بزن.",
             reply_markup=room_host_keyboard())
         return
 
-    # ---------- ورود به اتاق ----------
+    # ---------- ورود به اتاق (نمایش لیست شیشه‌ای) ----------
     if text == "🚪 ورود به اتاق":
         for code, room in list(rooms.items()):
             if any(p["id"] == user_id for p in room["players"]):
                 send_message(chat_id, f"تو الان توی اتاق `{code}` هستی!")
                 return
-        send_message(chat_id, "کد اتاق رو بفرست (مثلاً: `A7XK`):")
-        # وضعیت انتظار کد اتاق
-        rooms["_pending_join_" + str(user_id)] = {"waiting": True}
-        return
+        
+        # پیدا کردن اتاق‌های در حال انتظار
+        waiting_rooms = {code: room for code, room in rooms.items() if room["state"] == "waiting"}
+        if not waiting_rooms:
+            send_message(chat_id, "❌ هیچ اتاق بازی بازی‌ای در حال انتظار نیست! می‌تونی خودت یکی بسازی.")
+            return
 
-    # ---------- دریافت کد اتاق ----------
-    if str(user_id) in [k.replace("_pending_join_", "") for k in rooms if k.startswith("_pending_join_")]:
-        code = text.strip().upper()
-        pending_key = "_pending_join_" + str(user_id)
-        if pending_key in rooms:
-            del rooms[pending_key]
-        if code in rooms:
-            room = rooms[code]
-            if room["state"] != "waiting":
-                send_message(chat_id, "این اتاق بازی‌ش شروع شده و نمی‌تونی وارد بشی!")
-                return
-            room["players"].append({"id": user_id, "name": name})
-            send_message(chat_id, f"👤 **{name}** وارد اتاق `{code}` شد! ({len(room['players'])} نفر)", reply_markup=room_guest_keyboard())
-            # اطلاع به میزبان
-            send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
-        else:
-            send_message(chat_id, "❌ اتاقی با این کد پیدا نشد! دوباره کد رو بفرست یا گزینه «ورود به اتاق» رو بزن.")
+        # ساخت دکمه‌های شیشه‌ای برای لیست اتاق‌ها
+        inline_buttons = []
+        for code, room in waiting_rooms.items():
+            host_name = room["players"][0]["name"]
+            player_count = len(room["players"])
+            inline_buttons.append([
+                {"text": f"🏠 اتاق {code} (میزبان: {host_name} - {player_count} نفر)", "callback_data": f"join_{code}"}
+            ])
+        
+        send_message(chat_id, "🚪 یکی از اتاق‌های زیر رو برای ورود انتخاب کن:", reply_markup={"inline_keyboard": inline_buttons})
         return
 
     # ---------- حذف اتاق ----------
     if text == "🗑 حذف اتاق":
         for code, room in list(rooms.items()):
             if room["host_id"] == user_id:
-                # اطلاع به همه اعضا
                 for p in room["players"]:
                     if p["id"] != user_id:
                         send_message(p["id"], f"🗑 اتاق `{code}` توسط میزبان حذف شد.", reply_markup=main_keyboard())
@@ -203,7 +196,6 @@ def handle_text(chat_id, user_id, text):
                     room["players"].remove(p)
                     send_message(chat_id, f"از اتاق `{code}` خارج شدی.", reply_markup=main_keyboard())
                     if room["host_id"] == user_id:
-                        # میزبان خارج شد => حذف اتاق
                         for q in room["players"]:
                             send_message(q["id"], f"🗑 میزبان اتاق `{code}` خارج شد و اتاق حذف شد.", reply_markup=main_keyboard())
                         del rooms[code]
@@ -252,6 +244,27 @@ def start_new_round(code):
 
 
 def handle_callback(chat_id, user_id, data):
+    # ---------- کلیک روی دکمه ورود به اتاق ----------
+    if data.startswith("join_"):
+        code = data.split("_")[1]
+        name = profiles.get(user_id, {}).get("name", "بازیکن")
+
+        # چک کردن اینکه کاربر توی اتاق دیگه‌ای نباشه
+        for c, r in rooms.items():
+            if any(p["id"] == user_id for p in r["players"]):
+                send_message(chat_id, f"تو الان توی اتاق `{c}` هستی!")
+                return
+
+        if code in rooms and rooms[code]["state"] == "waiting":
+            room = rooms[code]
+            room["players"].append({"id": user_id, "name": name})
+            send_message(chat_id, f"👤 **{name}** وارد اتاق `{code}` شد! ({len(room['players'])} نفر)", reply_markup=room_guest_keyboard())
+            send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
+        else:
+            send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بازی‌اش شروع شده است!")
+        return
+
+    # ---------- انتخاب جرات یا حقیقت داخل بازی ----------
     for code, room in rooms.items():
         if room["state"] == "playing":
             target = room["players"][room["turn_index"]]
