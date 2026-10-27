@@ -143,13 +143,11 @@ def handle_text(chat_id, user_id, text):
                 send_message(chat_id, f"تو الان توی اتاق `{code}` هستی!")
                 return
         
-        # پیدا کردن اتاق‌های در حال انتظار
         waiting_rooms = {code: room for code, room in rooms.items() if room["state"] == "waiting"}
         if not waiting_rooms:
-            send_message(chat_id, "❌ هیچ اتاق بازی بازی‌ای در حال انتظار نیست! می‌تونی خودت یکی بسازی.")
+            send_message(chat_id, "❌ هیچ اتاق بازی‌ای در حال انتظار نیست! می‌تونی خودت یکی بسازی.")
             return
 
-        # ساخت دکمه‌های شیشه‌ای برای لیست اتاق‌ها
         inline_buttons = []
         for code, room in waiting_rooms.items():
             host_name = room["players"][0]["name"]
@@ -205,17 +203,32 @@ def handle_text(chat_id, user_id, text):
         send_message(chat_id, "تو توی هیچ اتاقی نیستی!")
         return
 
-    # ---------- پیام‌های داخل بازی ----------
+    # ---------- پیام‌های داخل بازی (سوال و جواب) ----------
     for code, room in rooms.items():
-        if room["state"] == "playing" and any(p["id"] == user_id for p in room["players"]):
+        if room["state"] == "playing":
+            # بررسی اینکه کاربر عضو این اتاق هست یا نه
+            if not any(p["id"] == user_id for p in room["players"]):
+                continue
+
             target = room["players"][room["turn_index"]]
             asker = room["players"][room["asker_index"]]
+
+            # ۱. اگر نوبت پرسشگر است که سوال بفرستد
             if user_id == asker["id"] and room.get("sub_state") == "waiting_for_question":
                 room["sub_state"] = "waiting_for_answer"
-                send_message(chat_id, f"❓ **سوال برای {target['name']}:**\n\n_{text}_\n\nحالا جواب بده!")
+                choice_label = room.get("last_choice", "سوال")
+                
+                # ارسال سوال به بازیکن هدف و بقیه اعضا
+                for p in room["players"]:
+                    send_message(p["id"], f"❓ **سوال ({choice_label}) از طرف {asker['name']} برای {target['name']}:**\n\n_{text}_\n\n👉 **{target['name']}**، حالا جواب خودت رو بفرست:")
                 return
+
+            # ۲. اگر نوبت بازیکن هدف است که جواب بدهد
             if user_id == target["id"] and room.get("sub_state") == "waiting_for_answer":
-                send_message(chat_id, f"✅ جواب **{target['name']}** ثبت شد! بریم راند بعدی...")
+                for p in room["players"]:
+                    send_message(p["id"], f"💬 **پاسخ {target['name']}:**\n\n_{text}_\n\n✨ این راند تمام شد! بریم راند بعدی...")
+                
+                # رفتن به راند بعد
                 room["turn_index"] = (room["turn_index"] + 1) % len(room["players"])
                 room["asker_index"] = (room["asker_index"] + 1) % len(room["players"])
                 start_new_round(code)
@@ -239,7 +252,7 @@ def start_new_round(code):
     }
     for p in room["players"]:
         send_message(p["id"],
-            f"🎯 اتاق `{code}`\nنوبت: **{target['name']}**\nپرسشگر: **{asker['name']}**\n\nجرات یا حقیقت؟",
+            f"🎯 اتاق `{code}`\n\n👤 نوبت انتخاب: **{target['name']}**\n❓ پرسشگر این راند: **{asker['name']}**\n\n**{target['name']}** عزیز، جرات یا حقیقت؟",
             reply_markup=keyboard)
 
 
@@ -249,7 +262,6 @@ def handle_callback(chat_id, user_id, data):
         code = data.split("_")[1]
         name = profiles.get(user_id, {}).get("name", "بازیکن")
 
-        # چک کردن اینکه کاربر توی اتاق دیگه‌ای نباشه
         for c, r in rooms.items():
             if any(p["id"] == user_id for p in r["players"]):
                 send_message(chat_id, f"تو الان توی اتاق `{c}` هستی!")
@@ -268,13 +280,15 @@ def handle_callback(chat_id, user_id, data):
     for code, room in rooms.items():
         if room["state"] == "playing":
             target = room["players"][room["turn_index"]]
-            if user_id == target["id"]:
+            if user_id == target["id"] and room.get("sub_state") == "choosing_jd":
                 choice_text = "حقیقت 🤫" if data == "truth" else "جرات 😈"
+                room["last_choice"] = choice_text
                 asker = room["players"][room["asker_index"]]
                 room["sub_state"] = "waiting_for_question"
+                
                 for p in room["players"]:
                     send_message(p["id"],
-                        f"🔔 **{target['name']}** گزینه **{choice_text}** رو انتخاب کرد!\n\nحالا **{asker['name']}** سوالش رو بفرسته.")
+                        f"🔔 **{target['name']}** گزینه **{choice_text}** رو انتخاب کرد!\n\n✍️ حالا **{asker['name']}** باید سوالش رو برای **{target['name']}** بفرسته:")
                 return
 
 
