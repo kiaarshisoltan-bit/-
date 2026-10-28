@@ -1,4 +1,4 @@
-مهراب: import os
+import os
 import random
 import sqlite3
 import secrets
@@ -132,7 +132,7 @@ def init_db():
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS daily_claims (
-مهراب: chat_id INTEGER NOT NULL,
+chat_id INTEGER NOT NULL,
                 claim_date TEXT NOT NULL,
                 PRIMARY KEY(chat_id, claim_date)
             )
@@ -283,7 +283,7 @@ def add_game_stat(chat_id, kind):
                     dare_count = dare_count + 1
                 WHERE chat_id = ?
             """, (chat_i
-مهراب: d,))
+d,))
 
 
 def process_referral(new_id, inviter_id):
@@ -430,7 +430,7 @@ def start_room_game(chat_id, code):
     with db() as conn:
         room = conn.execute(
             "SELECT * FROM rooms WHERE code = ?",
-مهراب: (code,),
+(code,),
         ).fetchone()
 
         if not room:
@@ -574,7 +574,7 @@ def claim_daily(chat_id):
 
 def shop_text(chat_id):
     user = get_user(chat_id)
-مهراب: if not user:
+if not user:
         return
 
     items = []
@@ -714,7 +714,7 @@ def webhook():
 
                     inviter_id = pending_referral.pop(chat_id, None)
                     i
-مهراب: f inviter_id:
+f inviter_id:
                         process_referral(chat_id, inviter_id)
 
                 pending_name.discard(chat_id)
@@ -946,7 +946,7 @@ def webhook():
             send_message(chat_id, "نام مستعار جدید را بفرست (۲ تا ۲۰ نویسه):")
 
         elif text == "📊 آمار من":
-مهراب: user = get_user(chat_id)
+user = get_user(chat_id)
 
             with db() as conn:
                 stats = conn.execute(
