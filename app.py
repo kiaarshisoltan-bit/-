@@ -17,8 +17,9 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://jorat-bot.onrender.c
 CHANNEL_ID = "@ettelae_resani"
 
 # متغیرهای حافظه
-profiles = {}
+profiles = {}       # {user_id: {"name": str, "score": int}}
 pending_name = {}
+changing_name = set()
 rooms = {}
 single_player = {}
 
@@ -68,26 +69,33 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload)
+        response = requests.post(url, json=payload)
+        return response.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Error sending message: {e}")
+        return None
 
 
-def send_photo(chat_id, photo_id, caption=""):
+def send_photo(chat_id, photo_id, caption="", reply_markup=None):
     url = f"{BASE_URL}/sendPhoto"
     payload = {"chat_id": chat_id, "photo": photo_id, "caption": caption, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload)
+        response = requests.post(url, json=payload)
+        return response.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Error sending photo: {e}")
+        return None
 
 
 def main_keyboard():
     return {
         "keyboard": [
             [{"text": "🎮 ساخت اتاق جدید"}, {"text": "🚪 ورود به اتاق"}],
-            [{"text": "🤖 بازی تک‌نفره (با ربات)"}],
-            [{"text": "📢 کانال اطلاع‌رسانی"}, {"text": "💡 پشتیبانی و نظرات"}]
+            [{"text": "🤖 بازی تک‌نفره (با ربات)"}, {"text": "🏆 جدول برترین‌ها"}],
+            [{"text": "✏️ تغییر نام"}, {"text": "📢 کانال اطلاع‌رسانی"}],
+            [{"text": "💡 پشتیبانی و نظرات"}]
         ],
         "resize_keyboard": True
     }
@@ -160,6 +168,44 @@ def handle_text(chat_id, user_id, text):
             "💡 **ارسال ایده، گزارش مشکل و نظرات:**\n\nاگر باگ یا مشکلی دیدین، یا ایده‌ای برای بهتر شدن ربات دارید، می‌تونید به سازنده ربات پیام بدید:\n\n📩 آیدی ارتباطی: `@KIA_karfarma`")
         return
 
+    if text == "🏆 جدول برترین‌ها":
+        if not profiles:
+            send_message(chat_id, "هنوز هیچ بازیکنی ثبت‌نام نکرده!")
+            return
+        sorted_players = sorted(profiles.values(), key=lambda x: x.get("score", 0), reverse=True)
+        text_lb = "🏆 **جدول برترین بازیکنان ربات:**\n\n"
+        for i, p in enumerate(sorted_players[:10], 1):
+            medal = "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"{i}."))
+            text_lb += f"{medal} **{p['name']}** — امتیاز: `{p.get('score', 0)}`\n"
+        send_message(chat_id, text_lb, reply_markup=main_keyboard())
+        return
+
+    if text == "✏️ تغییر نام":
+        for code, room in rooms.items():
+            if any(p["id"] == user_id for p in room["players"]):
+                send_message(chat_id, "❌ شما در حال حاضر در یک اتاق هستید! اول از اتاق خارج شوید یا بازی را تمام کنید.")
+                return
+        changing_name.add(user_id)
+        send_message(chat_id, "✏️ لطفاً اسم جدید خود را ارسال کنید:\n*(توجه: اسم نباید تکراری باشد و حداقل ۲ حرف داشته باشد)*")
+        return
+
+    # مدیریت تغییر نام
+    if user_id in changing_name:
+        name = text.strip()
+        if len(name) < 2:
+            send_message(chat_id, "اسم خیلی کوتاهه! یه اسم با حداقل ۲ حرف بفرست:")
+            return
+        if any(p["name"] == name for uid, p in profiles.items() if uid != user_id):
+            send_message(chat_id, "😬 این اسم قبلاً توسط بازیکن دیگه‌ای انتخاب شده! یه اسم دیگه بچین:")
+            return
+        # حفظ امتیاز قبلی کاربر هنگام تغییر نام
+        current_score = profiles.get(user_id, {}).get("score", 0)
+        profiles[user_id] = {"name": name, "score": current_score}
+        changing_name.remove(user_id)
+        send_message(chat_id, f"✅ نام شما با موفقیت به **{name}** تغییر یافت! 🎉", reply_markup=main_keyboard())
+        return
+
+    # مدیریت ثبت نام اولیه
     if user_id in pending_name:
         name = text.strip()
         if len(name) < 2:
@@ -168,7 +214,7 @@ def handle_text(chat_id, user_id, text):
         if any(p["name"] == name for p in profiles.values()):
             send_message(chat_id, "😬 این اسم قبلاً توسط بازیکن دیگه‌ای انتخاب شده! یه اسم دیگه بچین:")
             return
-        profiles[user_id] = {"name": name}
+        profiles[user_id] = {"name": name, "score": 0}
         del pending_name[user_id]
         send_message(chat_id, f"✅ خوش اومدی **{name}** جان!\nحالا می‌تونی اتاق بسازی، به اتاق‌ها بپیوندی یا با ربات تک‌نفره بازی کنی.", reply_markup=main_keyboard())
         return
@@ -218,7 +264,8 @@ def handle_text(chat_id, user_id, text):
             "state": "waiting",
             "turn_index": 0,
             "asker_index": 0,
-            "sub_state": None
+            "sub_state": None,
+            "voted_users": set()
         }
         send_message(chat_id,
             f"🎮 اتاق ساخته شد!\n\n📌 **کد اتاق:** `{code}`\n👑 میزبان: **{name}**\n\nبا دکمه «ورود به اتاق» بقیه می‌تونن لیست رو ببینن و بیان.\nوقتی همه جمع شدن، روی «🚀 شروع بازی» بزن.",
@@ -313,16 +360,21 @@ def handle_game_input(chat_id, user_id, text, photo_id=None):
                     return True
 
             if user_id == target["id"] and room.get("sub_state") == "waiting_for_answer":
+                room["voted_users"] = set()
+                vote_markup = {
+                    "inline_keyboard": [
+                        [{"text": "👍 لایک و امتیاز (+1)", "callback_data": f"vote_{target['id']}_{code}"}],
+                        [{"text": "⏭ رد شدن و رفتن به راند بعد", "callback_data": f"next_{code}"}]
+                    ]
+                }
                 if photo_id:
                     for p in room["players"]:
-                        send_photo(p["id"], photo_id, caption=f"📸 **تصویر انجام جرات توسط {target['name']}:**\n_{text}_\n\n✨ این راند تمام شد! بریم راند بعدی...")
+                        send_photo(p["id"], photo_id, caption=f"📸 **پاسخ جرات توسط {target['name']}:**\n_{text}_\n\n⭐ به این جواب رای بدید یا برید راند بعدی:", reply_markup=vote_markup)
                 else:
                     for p in room["players"]:
-                        send_message(p["id"], f"💬 **پاسخ {target['name']}:**\n\n_{text}_\n\n✨ این راند تمام شد! بریم راند بعدی...")
+                        send_message(p["id"], f"💬 **پاسخ {target['name']}:**\n\n_{text}_\n\n⭐ به این جواب رای بدید یا برید راند بعدی:", reply_markup=vote_markup)
                 
-                room["turn_index"] = (room["turn_index"] + 1) % len(room["players"])
-                room["asker_index"] = (room["asker_index"] + 1) % len(room["players"])
-                start_new_round(code)
+                room["sub_state"] = "voting_active"
                 return True
 
     return False
@@ -393,6 +445,36 @@ def handle_callback(chat_id, user_id, data):
             send_message(room["host_id"], f"🔔 **{name}** به اتاقت پیوست! ({len(room['players'])} نفر)")
         else:
             send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بازی‌ش شروع شده است!")
+        return
+
+    if data.startswith("vote_"):
+        parts = data.split("_")
+        target_id = int(parts[1])
+        code = parts[2]
+        if code in rooms:
+            room = rooms[code]
+            if not any(p["id"] == user_id for p in room["players"]):
+                send_message(chat_id, "شما عضو این اتاق نیستید!")
+                return
+            if user_id in room["voted_users"]:
+                send_message(chat_id, "شما قبلاً به این جواب رای داده‌اید! 😉")
+                return
+            room["voted_users"].add(user_id)
+            if target_id in profiles:
+                profiles[target_id]["score"] = profiles[target_id].get("score", 0) + 1
+                target_name = profiles[target_id]["name"]
+                send_message(chat_id, f"✅ رای شما ثبت شد! یک امتیاز به **{target_name}** اضافه شد. 🌟")
+        return
+
+    if data.startswith("next_"):
+        code = data.split("_")[1]
+        if code in rooms:
+            room = rooms[code]
+            if not any(p["id"] == user_id for p in room["players"]):
+                return
+            room["turn_index"] = (room["turn_index"] + 1) % len(room["players"])
+            room["asker_index"] = (room["asker_index"] + 1) % len(room["players"])
+            start_new_round(code)
         return
 
     for code, room in rooms.items():
