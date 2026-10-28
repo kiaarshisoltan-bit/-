@@ -1,11 +1,15 @@
 import os
+import time
 import random
+import threading
+import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# تنظیمات اصلی ربات
+# تنظیمات اصلی
 BOT_TOKEN = "*******"
+RENDER_URL = os.environ.get("RENDER_URL", "https://jorat-bot.onrender.com")
 BALE_API_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
 # پایگاه داده در حافظه
@@ -13,9 +17,22 @@ profiles = {}
 pending_name = set()  
 rooms = {}            
 scores = {}           
+user_states = {}      
 
+# --- نگهداری ربات بیدار روی Render ---
+def keep_alive():
+    while True:
+        try:
+            if RENDER_URL:
+                requests.get(RENDER_URL, timeout=10)
+        except Exception:
+            pass
+        time.sleep(240)
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
+# --- توابع ارتباطی بله ---
 def send_message(chat_id, text, reply_markup=None):
-    import requests
     url = f"{BALE_API_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -42,21 +59,21 @@ def get_main_menu():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "Jorat-o-Haghighat Bot is online and ready!", 200
+    return "Jorat-o-Haghighat Bot is running!", 200
 
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        data = request.get_json(force=True)
+        data = request.get_json()
         if not data:
-            return jsonify({"status": "error", "message": "No data received"}), 400
+            return jsonify({"status": "error"}), 400
 
         if "message" in data:
             msg = data["message"]
             chat_id = msg["chat"]["id"]
             text = msg.get("text", "").strip()
 
-            # ثبت نام یا تغییر نام
+            # بررسی تغییر نام یا ثبت‌نام اولیه
             if chat_id in pending_name:
                 if len(text) < 2:
                     send_message(chat_id, "❌ نام مستعار باید حداقل ۲ حرف باشد. لطفاً دوباره بفرست:")
@@ -65,7 +82,8 @@ def webhook():
                 profiles[chat_id] = text
                 pending_name.remove(chat_id)
                 scores[chat_id] = scores.get(chat_id, 0) + 15
-                send_message(chat_id, f"✅ عالی شد کیا جان! نام مستعار تو به **{text}** ثبت شد (+15 سکه 🎉)", get_main_menu())
+                user_states.pop(chat_id, None)
+                send_message(chat_id, f"✅ عالی شد کیا جان! نام مستعار تو به **{text}** تغییر کرد (+15 سکه 🎉)", get_main_menu())
                 return jsonify({"status": "ok"})
 
             if chat_id not in profiles:
@@ -73,27 +91,36 @@ def webhook():
                 send_message(chat_id, "👋 سلام کیا جان! به ربات **جرئت و حقیقت** خوش اومدی.\n\nلطفاً یک **نام مستعار منحصر‌به‌فرد** برای خودت بفرست:")
                 return jsonify({"status": "ok"})
 
-            # منوی بازگشت و شروع
+            # اگر کاربر دکمه بازگشت یا منو رو زد، حتماً حالت‌ها رو پاک کن
             if text in ["🏠 بازگشت به منوی اصلی", "/start"]:
+                user_states.pop(chat_id, None)
                 if text == "/start":
                     send_message(chat_id, f"خوش برگشتی {profiles[chat_id]} عزیز! منوی اصلی:", get_main_menu())
                 else:
                     send_message(chat_id, "🏠 منوی اصلی:", get_main_menu())
                 return jsonify({"status": "ok"})
 
-            # بخش اتاق‌ها
-            if text.startswith("🚪 ورود به اتاق "):
-                room_code = text.split(" ")[3]
+            # بررسی حالت‌های انتظار (مثل وارد کردن کد اتاق)
+            state = user_states.get(chat_id)
+            if state == "waiting_room_code":
+                room_code = text.upper()
                 if room_code in rooms:
                     if chat_id not in rooms[room_code]["members"]:
                         rooms[room_code]["members"].append(chat_id)
+                    user_states.pop(chat_id, None)
                     send_message(chat_id, f"✅ با موفقیت به اتاق `{room_code}` ملحق شدی! 🎉", get_main_menu())
                     host_id = rooms[room_code]["host"]
                     send_message(host_id, f"👤 کاربر `{profiles.get(chat_id, 'ناشناس')}` به اتاق شما پیوست!")
                 else:
-                    send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بسته شده است.", get_main_menu())
+                    # دکمه بازگشت اضطراری زیر پیام ارور برای راحتی کاربر
+                    kb = {
+                        "keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]],
+                        "resize_keyboard": True
+                    }
+                    send_message(chat_id, "❌ این اتاق وجود نداره. کد درستی وارد کن یا دکمه زیر رو بزن:", kb)
                 return jsonify({"status": "ok"})
 
+            # پردازش دکمه‌های منوی اصلی و گزینه‌ها
             if text == "🎮 بازی چندنفره (اتاق)":
                 kb = {
                     "keyboard": [
@@ -125,15 +152,13 @@ def webhook():
                     send_message(chat_id, "❌ شما صاحب این اتاق نیستید یا اتاق وجود ندارد.", get_main_menu())
 
             elif text == "🚪 پیوستن به اتاق":
-                if not rooms:
-                    kb = {"keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]], "resize_keyboard": True}
-                    send_message(chat_id, "❌ در حال حاضر هیچ اتاقی ساخته نشده است.", kb)
-                else:
-                    keyboard_rows = [[{"text": f"🚪 ورود به اتاق {r_code}"}] for r_code in rooms.keys()]
-                    keyboard_rows.append([{"text": "🏠 بازگشت به منوی اصلی"}])
-                    send_message(chat_id, "📋 لیست اتاق‌های فعال:", {"keyboard": keyboard_rows, "resize_keyboard": True})
+                user_states[chat_id] = "waiting_room_code"
+                kb = {
+                    "keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]],
+                    "resize_keyboard": True
+                }
+                send_message(chat_id, "🔑 لطفاً کد ۴ رقمی اتاق مورد نظرت رو بفرست:", kb)
 
-            # بخش تک‌نفره
             elif text == "🤖 بازی تک‌نفره":
                 kb = {
                     "keyboard": [
@@ -165,9 +190,8 @@ def webhook():
 
             elif text == "🎡 چرخش چرخ شانس":
                 choice = random.choice(["حقیقت ❓", "جرات 🔥"])
-                send_message(chat_id, f"🎡 چرخش چرخ شانس چرخید و اومد روی: **{choice}**!")
+                send_message(chat_id, f"🎡 چرخ شانس چرخید و اومد روی: **{choice}**!")
 
-            # سایر بخش‌ها
             elif text == "🏆 جدول رده‌بندی":
                 top_users = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
                 lb_text = "🏆 **جدول رده‌بندی برترین‌ها:**\n\n"
@@ -203,9 +227,10 @@ def webhook():
                 send_message(chat_id, "دستور نامعتبر. از دکمه‌های پایین صفحه استفاده کن:", get_main_menu())
 
         return jsonify({"status": "ok"})
+
     except Exception as e:
         print(f"Webhook error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
