@@ -1,3 +1,2 @@
-    py-bale
-    flask
-    requests
+flask
+requests
