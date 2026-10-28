@@ -1,65 +1,91 @@
 import os
-import logging
-import random
 import threading
 import time
 import requests
 from flask import Flask
-from bale import Bot, Message, Update
-from bale.ext.commands import Bot as ExtBot
 
-# --- تنظیمات وب‌سرور برای جلوگیری از خوابیدن رندر ---
+# --- تنظیمات وب‌سرور برای رندر ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "ربات فعال است و در حال کار در پس‌زمینه... 🚀"
+    return "Bot is Running! 🚀"
 
 def run_flask():
-    # استفاده از پورت محیطی که رندر تعیین می‌کند
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- تنظیمات ربات ---
-TOKEN = "*******" # توکن تو
-bot = ExtBot(token=TOKEN)
+# --- تنظیمات ربات بله ---
+# توکن خودت رو اینجا بذار
+BOT_TOKEN = "*******" 
+BASE_URL = "https://api.bale.ai/v1" # آدرس API بله
 
+# دیتابیس ساده
 users_db = {}
-rooms_db = {}
 
-# (بخش دستورات مثل Start، Truth و Dare که قبلاً نوشتم رو اینجا اضافه کن)
+def send_message(chat_id, text):
+    """یک تابع کمکی برای ارسال پیام ساده با استفاده از API بله"""
+    url = f"{BASE_URL}/messages/send"
+    payload = {
+        "chat_id": chat_id,
+        "text": text
+    }
+    headers = {
+        "Authorization": f"Bearer {BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        return response.json()
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        return None
 
-@bot.command(name="start")
-async def start_command(message: Message):
-    user_id = message.author.id
-    name = message.author.first_name or "کیا جان"
-    if user_id not in users_db:
-        users_db[user_id] = {"name": name, "coins": 100, "score": 10}
-    await message.reply(f"سلام {name}! به قلمرو بازی خوش اومدی. 🎮")
-
-# --- سیستم خودکار پینگ (Self-Ping) ---
-def self_ping():
-    # این بخش سعی می‌کند آدرس خود رندر را پینگ کند
-    # البته بهتر است از UptimeRobot استفاده کنی که به URL رندر درخواست بزند
+# --- سیستم دریافت پیام (Polling) ---
+# چون در رندر نمی‌تونیم از Webhook ساده استفاده کنیم، از Polling استفاده می‌کنیم
+def bot_loop():
+    print("Bot loop started...")
+    last_update_id = 0
+    
     while True:
+        url = f"{BASE_URL}/updates?offset={last_update_id + 1}"
+        headers = {"Authorization": f"Bearer {BOT_TOKEN}"}
+        
         try:
-            # جایگزین کردن با URL اصلی که رندر بهت میده
-            # مثلا: https://my-bot.onrender.com
-            # requests.get("https://your-app-name.onrender.com") 
-            print("Checking connection...")
-        except:
-            pass
-        time.sleep(300) # هر ۵ دقیقه یکبار
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                updates = response.json().get("result", [])
+                for update in updates:
+                    last_update_id = update.get("update_id")
+                    
+                    # بررسی اگر پیام متنی بود
+                    if "message" in update:
+                        msg = update["message"]
+                        chat_id = msg["chat"]["id"]
+                        text = msg.get("text", "")
 
-# --- اجرای همزمان ---
+                        # دستور شروع
+                        if text == "/start":
+                            user_id = chat_id
+                            users_db[user_id] = {"name": "User", "coins": 100}
+                            send_message(chat_id, "سلام کیا عزیز! ربات با موفقیت بالا اومد. 🚀")
+                        
+                        # دستور تست
+                        elif text == "/ping":
+                            send_message(chat_id, "Pong! 🏓")
+
+            else:
+                print(f"Error from API: {response.status_code}")
+        
+        except Exception as e:
+            print(f"Loop error: {e}")
+        
+        time.sleep(2) # صبر برای جلوگیری از فشار به سرور
+
 if __name__ == "__main__":
-    # ۱. شروع وب‌سرور در یک Thread جداگانه
+    # ۱. اجرای وب‌سرور
     t = threading.Thread(target=run_flask)
     t.start()
 
-    # ۲. شروع سیستم پینگ خودکار در یک Thread جداگانه
-    p = threading.Thread(target=self_ping)
-    p.start()
-
-    # ۳. اجرای اصلی ربات
-    bot.run()
+    # ۲. اجرای حلقه ربات
+    bot_loop()
