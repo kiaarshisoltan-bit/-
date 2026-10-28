@@ -7,8 +7,8 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# تنظیمات اصلی
-BOT_TOKEN = "*******"
+# تنظیمات اصلی با توکن جدید
+BOT_TOKEN = "1892656218:RKl_cA6b4OJuSoMJ1GCSWznqC1WD5X46OWw"
 RENDER_URL = os.environ.get("RENDER_URL", "https://jorat-bot.onrender.com")
 BALE_API_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
