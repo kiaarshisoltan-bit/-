@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # تنظیمات اصلی
-BOT_TOKEN = "1892656218:RKl_cA6b4OJuSoMJ1GCSWznqC1WD5X46OWw"
+BOT_TOKEN = "*******"
 RENDER_URL = os.environ.get("RENDER_URL", "https://jorat-bot.onrender.com")
 BALE_API_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
@@ -91,7 +91,7 @@ def webhook():
                 send_message(chat_id, "👋 سلام کیا جان! به ربات **جرئت و حقیقت** خوش اومدی.\n\nلطفاً یک **نام مستعار منحصر‌به‌فرد** برای خودت بفرست:")
                 return jsonify({"status": "ok"})
 
-            # اگر کاربر دکمه بازگشت یا منو رو زد، حتماً حالت‌ها رو پاک کن
+            # اگر کاربر دکمه بازگشت یا منو رو زد، حالت‌ها پاک بشن
             if text in ["🏠 بازگشت به منوی اصلی", "/start"]:
                 user_states.pop(chat_id, None)
                 if text == "/start":
@@ -100,10 +100,9 @@ def webhook():
                     send_message(chat_id, "🏠 منوی اصلی:", get_main_menu())
                 return jsonify({"status": "ok"})
 
-            # بررسی حالت‌های انتظار (مثل وارد کردن کد اتاق)
-            state = user_states.get(chat_id)
-            if state == "waiting_room_code":
-                room_code = text.upper()
+            # پردازش انتخاب اتاق از روی لیست دکمه‌ها
+            if text.startswith("🚪 ورود به اتاق "):
+                room_code = text.split(" ")[3]
                 if room_code in rooms:
                     if chat_id not in rooms[room_code]["members"]:
                         rooms[room_code]["members"].append(chat_id)
@@ -112,12 +111,7 @@ def webhook():
                     host_id = rooms[room_code]["host"]
                     send_message(host_id, f"👤 کاربر `{profiles.get(chat_id, 'ناشناس')}` به اتاق شما پیوست!")
                 else:
-                    # دکمه بازگشت اضطراری زیر پیام ارور برای راحتی کاربر
-                    kb = {
-                        "keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]],
-                        "resize_keyboard": True
-                    }
-                    send_message(chat_id, "❌ این اتاق وجود نداره. کد درستی وارد کن یا دکمه زیر رو بزن:", kb)
+                    send_message(chat_id, "❌ این اتاق دیگر وجود ندارد یا بسته شده است.", get_main_menu())
                 return jsonify({"status": "ok"})
 
             # پردازش دکمه‌های منوی اصلی و گزینه‌ها
@@ -152,12 +146,24 @@ def webhook():
                     send_message(chat_id, "❌ شما صاحب این اتاق نیستید یا اتاق وجود ندارد.", get_main_menu())
 
             elif text == "🚪 پیوستن به اتاق":
-                user_states[chat_id] = "waiting_room_code"
-                kb = {
-                    "keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]],
-                    "resize_keyboard": True
-                }
-                send_message(chat_id, "🔑 لطفاً کد ۴ رقمی اتاق مورد نظرت رو بفرست:", kb)
+                if not rooms:
+                    kb = {
+                        "keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]],
+                        "resize_keyboard": True
+                    }
+                    send_message(chat_id, "❌ در حال حاضر هیچ اتاقی ساخته نشده است. می‌توانی خودت یک اتاق جدید بسازی!", kb)
+                else:
+                    # ساخت لیست دکمه‌ها از اتاق‌های موجود
+                    keyboard_rows = []
+                    for r_code in rooms.keys():
+                        keyboard_rows.append([{"text": f"🚪 ورود به اتاق {r_code}"}])
+                    keyboard_rows.append([{"text": "🏠 بازگشت به منوی اصلی"}])
+                    
+                    kb = {
+                        "keyboard": keyboard_rows,
+                        "resize_keyboard": True
+                    }
+                    send_message(chat_id, "📋 لیست اتاق‌های فعال:\nبرای ورود به هر اتاق، روی آن کلیک کن:", kb)
 
             elif text == "🤖 بازی تک‌نفره":
                 kb = {
@@ -190,7 +196,7 @@ def webhook():
 
             elif text == "🎡 چرخش چرخ شانس":
                 choice = random.choice(["حقیقت ❓", "جرات 🔥"])
-                send_message(chat_id, f"🎡 چرخ شانس چرخید و اومد روی: **{choice}**!")
+                send_message(chat_id, f"🎡 چرخش چرخ شانس چرخید و اومد روی: **{choice}**!")
 
             elif text == "🏆 جدول رده‌بندی":
                 top_users = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
