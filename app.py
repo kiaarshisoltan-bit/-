@@ -45,7 +45,6 @@ def send_message(chat_id, text, reply_markup=None):
         return None
 
 def get_main_menu():
-    # ساخت کیبورد معمولی (Reply Keyboard) در پایین صفحه
     return {
         "keyboard": [
             [{"text": "🎮 بازی چندنفره (اتاق)"}, {"text": "🤖 بازی تک‌نفره"}],
@@ -92,7 +91,16 @@ def webhook():
                 send_message(chat_id, "👋 سلام کیا جان! به ربات **جرئت و حقیقت** خوش اومدی.\n\nلطفاً یک **نام مستعار منحصر‌به‌فرد** برای خودت بفرست:")
                 return jsonify({"status": "ok"})
 
-            # بررسی حالت‌های انتظار (مثل وارد کردن کد اتاق یا نام مستعار جدید)
+            # اگر کاربر دکمه بازگشت یا منو رو زد، حتماً حالت‌ها رو پاک کن
+            if text in ["🏠 بازگشت به منوی اصلی", "/start"]:
+                user_states.pop(chat_id, None)
+                if text == "/start":
+                    send_message(chat_id, f"خوش برگشتی {profiles[chat_id]} عزیز! منوی اصلی:", get_main_menu())
+                else:
+                    send_message(chat_id, "🏠 منوی اصلی:", get_main_menu())
+                return jsonify({"status": "ok"})
+
+            # بررسی حالت‌های انتظار (مثل وارد کردن کد اتاق)
             state = user_states.get(chat_id)
             if state == "waiting_room_code":
                 room_code = text.upper()
@@ -104,14 +112,16 @@ def webhook():
                     host_id = rooms[room_code]["host"]
                     send_message(host_id, f"👤 کاربر `{profiles.get(chat_id, 'ناشناس')}` به اتاق شما پیوست!")
                 else:
-                    send_message(chat_id, "❌ این اتاق وجود نداره. کد درستی وارد کن یا از منو گزینه دیگه‌ای انتخاب کن:", get_main_menu())
+                    # دکمه بازگشت اضطراری زیر پیام ارور برای راحتی کاربر
+                    kb = {
+                        "keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]],
+                        "resize_keyboard": True
+                    }
+                    send_message(chat_id, "❌ این اتاق وجود نداره. کد درستی وارد کن یا دکمه زیر رو بزن:", kb)
                 return jsonify({"status": "ok"})
 
             # پردازش دکمه‌های منوی اصلی و گزینه‌ها
-            if text == "/start":
-                send_message(chat_id, f"خوش برگشتی {profiles[chat_id]} عزیز! منوی اصلی:", get_main_menu())
-            
-            elif text == "🎮 بازی چندنفره (اتاق)":
+            if text == "🎮 بازی چندنفره (اتاق)":
                 kb = {
                     "keyboard": [
                         [{"text": "➕ ساخت اتاق جدید"}, {"text": "🚪 پیوستن به اتاق"}],
@@ -143,7 +153,11 @@ def webhook():
 
             elif text == "🚪 پیوستن به اتاق":
                 user_states[chat_id] = "waiting_room_code"
-                send_message(chat_id, "🔑 لطفاً کد ۴ رقمی اتاق مورد نظرت رو بفرست:")
+                kb = {
+                    "keyboard": [[{"text": "🏠 بازگشت به منوی اصلی"}]],
+                    "resize_keyboard": True
+                }
+                send_message(chat_id, "🔑 لطفاً کد ۴ رقمی اتاق مورد نظرت رو بفرست:", kb)
 
             elif text == "🤖 بازی تک‌نفره":
                 kb = {
@@ -208,9 +222,6 @@ def webhook():
 
             elif text == "🛠 پشتیبانی":
                 send_message(chat_id, "🛠 ارتباط با پشتیبانی (کیا): \nhttps://ble.ir/KIA_karfarma", get_main_menu())
-
-            elif text == "🏠 بازگشت به منوی اصلی":
-                send_message(chat_id, "🏠 منوی اصلی:", get_main_menu())
 
             else:
                 send_message(chat_id, "دستور نامعتبر. از دکمه‌های پایین صفحه استفاده کن:", get_main_menu())
