@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # تنظیمات بله
-BOT_TOKEN = "*******"
+BOT_TOKEN = "1892656218:oa22PFnJeGQvtSB7e1ty3Mgw0w6qdgy63AM"
 BALE_API_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
 # پایگاه داده در حافظه
