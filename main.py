@@ -321,6 +321,10 @@ def get_main_menu():
             [
                 {"text": "🏆 جدول امتیازات"},
                 {"text": "✏️ تغییر نام"}
+            ],
+            [
+                {"text": "📢 کانال اطلاع‌رسانی"},
+                {"text": "💬 پشتیبانی"}
             ]
         ],
         "resize_keyboard": True,
@@ -710,6 +714,32 @@ def handle_message(message):
         send_message(
             chat_id,
             "برای شروع /start را ارسال کن."
+        )
+
+        return
+
+    # لینک کانال اطلاع‌رسانی
+
+    if text == "📢 کانال اطلاع‌رسانی":
+
+        send_message(
+            chat_id,
+            "📢 برای ورود به کانال اطلاع‌رسانی روی لینک زیر بزن:\n"
+            "https://ble.ir/ettelae_resani",
+            get_main_menu()
+        )
+
+        return
+
+    # لینک پشتیبانی
+
+    if text == "💬 پشتیبانی":
+
+        send_message(
+            chat_id,
+            "💬 برای ارتباط با پشتیبانی روی لینک زیر بزن:\n"
+            "https://ble.ir/kia_karfarma",
+            get_main_menu()
         )
 
         return
