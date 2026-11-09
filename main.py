@@ -2152,52 +2152,83 @@ def handle_update(update):
 # =====================================================
 
 def run_polling():
-
-    offset = 0
+    offset = None
 
     print("🤖 Polling started")
 
     while True:
-
         try:
+            payload = {
+                "timeout": 30
+            }
 
-            response = requests.get(
+            if offset is not None:
+                payload["offset"] = offset
+
+            print("📡 Requesting updates...")
+
+            response = requests.post(
                 f"{BASE_URL}/getUpdates",
-                params={
-                    "offset": offset,
-                    "timeout": 30
-                },
+                json=payload,
                 timeout=40
             )
 
-            data = response.json()
+            print("📡 Response status:", response.status_code)
 
-            if not data.get("ok"):
-
-                time.sleep(3)
-
+            try:
+                data = response.json()
+            except Exception:
+                print("❌ Invalid JSON response:")
+                print(response.text)
+                time.sleep(5)
                 continue
 
-            for update in data.get("result", []):
+            if response.status_code != 200:
+                print("❌ HTTP Error:", response.status_code)
+                print(data)
+                time.sleep(5)
+                continue
+
+            if not data.get("ok", False):
+                print("❌ getUpdates API Error:")
+                print(data)
+                time.sleep(5)
+                continue
+
+            updates = data.get("result", [])
+
+            if updates:
+                print(f"📩 {len(updates)} update received")
+
+            for update in updates:
 
                 update_id = update.get("update_id")
 
                 if update_id is not None:
-
                     offset = update_id + 1
 
-                handle_update(update)
+                print("📩 Update received:")
+                print(update)
 
-        except Exception as error:
+                try:
+                    handle_update(update)
 
-            print(
-                "Polling Error:",
-                error
-            )
+                except Exception as error:
+                    print("❌ Handle Update Error:")
+                    print(repr(error))
 
+        except requests.exceptions.Timeout:
+            print("⏳ Polling timeout - retrying...")
+
+        except requests.exceptions.RequestException as error:
+            print("❌ Network Error:")
+            print(repr(error))
             time.sleep(5)
 
-
+        except Exception as error:
+            print("❌ Polling Error:")
+            print(repr(error))
+            time.sleep(5)
 # =====================================================
 # اجرای ربات
 # =====================================================
