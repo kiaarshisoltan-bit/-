@@ -13,9 +13,12 @@ from flask import Flask, jsonify
 # تنظیمات
 # =====================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-PORT = int(os.getenv("PORT", 10000))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
+
+VOTE_TIMEOUT = 60
+MAX_ROOM_PLAYERS = 20
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN تنظیم نشده است.")
@@ -25,37 +28,24 @@ if not DATABASE_URL:
 
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
-VOTE_TIMEOUT = 60
-
-MAX_ROOM_PLAYERS = 20
-
 app = Flask(__name__)
 
 
 # =====================================================
-# Lock ها
+# Lock ها و اطلاعات موقت
 # =====================================================
 
 db_lock = threading.Lock()
-
 state_lock = threading.RLock()
-
 room_lock = threading.RLock()
 
-
-# =====================================================
-# اطلاعات موقت
-# =====================================================
-
 user_states = {}
-
 single_player = {}
-
 rooms = {}
 
 
 # =====================================================
-# وب سرور برای Render
+# وب سرور
 # =====================================================
 
 @app.route("/")
@@ -65,18 +55,20 @@ def home():
 
 @app.route("/health")
 def health():
+    with room_lock:
+        room_count = len(rooms)
+
     return jsonify({
         "status": "ok",
-        "rooms": len(rooms)
+        "rooms": room_count
     })
 
 
 # =====================================================
-# اتصال به دیتابیس
+# دیتابیس
 # =====================================================
 
 def get_db():
-
     return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=10
@@ -86,12 +78,10 @@ def get_db():
 def init_database():
 
     with db_lock:
-
         db = get_db()
         cur = db.cursor()
 
         try:
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -103,81 +93,53 @@ def init_database():
 
             db.commit()
 
-            try:
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS users_unique_name_ci
+                ON users (LOWER(BTRIM(name)))
+            """)
 
-                cur.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS
-                    users_unique_name_ci
-                    ON users (
-                        LOWER(BTRIM(name))
-                    )
-                """)
+            db.commit()
 
-                db.commit()
-
-            except Exception as error:
-
-                db.rollback()
-
-                print(
-                    "⚠️ Unique name index warning:",
-                    error
-                )
+        except Exception as error:
+            db.rollback()
+            print("❌ Database init error:", error)
+            raise
 
         finally:
-
             cur.close()
             db.close()
 
     print("✅ PostgreSQL database initialized")
 
 
-# =====================================================
-# ابزارهای کاربران
-# =====================================================
-
 def normalize_name(name):
 
     if not isinstance(name, str):
         return ""
 
-    return " ".join(
-        name.strip().split()
-    )
+    return " ".join(name.strip().split())
 
 
 def user_exists(user_id):
 
     with db_lock:
-
         db = get_db()
         cur = db.cursor()
 
         try:
-
             cur.execute(
-                """
-                SELECT 1
-                FROM users
-                WHERE user_id = %s
-                """,
+                "SELECT 1 FROM users WHERE user_id = %s",
                 (user_id,)
             )
 
-            result = cur.fetchone()
+            return cur.fetchone() is not None
 
         finally:
-
             cur.close()
             db.close()
 
-    return result is not None
 
-
-def name_exists(
-    name,
-    exclude_user_id=None
-):
+def name_exists(name, exclude_user_id=None):
 
     name = normalize_name(name)
 
@@ -185,156 +147,140 @@ def name_exists(
         return False
 
     with db_lock:
-
         db = get_db()
         cur = db.cursor()
 
         try:
 
             if exclude_user_id is None:
-
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT 1
                     FROM users
                     WHERE LOWER(BTRIM(name)) =
                           LOWER(BTRIM(%s))
                     LIMIT 1
-                    """,
-                    (name,)
-                )
+                """, (name,))
 
             else:
-
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT 1
                     FROM users
                     WHERE LOWER(BTRIM(name)) =
                           LOWER(BTRIM(%s))
                     AND user_id <> %s
                     LIMIT 1
-                    """,
-                    (
-                        name,
-                        exclude_user_id
-                    )
-                )
+                """, (
+                    name,
+                    exclude_user_id
+                ))
 
-            result = cur.fetchone()
+            return cur.fetchone() is not None
 
         finally:
-
             cur.close()
             db.close()
 
-    return result is not None
 
-
-def save_user(user_id, name):
+def save_new_user(user_id, name):
 
     name = normalize_name(name)
 
-    if not name:
+    try:
+        with db_lock:
+            db = get_db()
+            cur = db.cursor()
+
+            try:
+                cur.execute("""
+                    INSERT INTO users (user_id, name, score)
+                    VALUES (%s, %s, 0)
+                """, (
+                    user_id,
+                    name
+                ))
+
+                db.commit()
+                return True
+
+            except psycopg2.IntegrityError:
+                db.rollback()
+                return False
+
+            finally:
+                cur.close()
+                db.close()
+
+    except Exception as error:
+        print("❌ Save user error:", error)
         return False
 
-    with db_lock:
 
-        db = get_db()
-        cur = db.cursor()
+def change_user_name(user_id, name):
 
-        try:
+    name = normalize_name(name)
 
-            cur.execute("""
-                INSERT INTO users (
-                    user_id,
+    try:
+        with db_lock:
+            db = get_db()
+            cur = db.cursor()
+
+            try:
+                cur.execute("""
+                    UPDATE users
+                    SET name = %s
+                    WHERE user_id = %s
+                """, (
                     name,
-                    score
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    0
-                )
+                    user_id
+                ))
 
-                ON CONFLICT (user_id)
-                DO UPDATE SET
-                    name = EXCLUDED.name
-            """, (
-                user_id,
-                name
-            ))
+                db.commit()
+                return True
 
-            db.commit()
+            except psycopg2.IntegrityError:
+                db.rollback()
+                return False
 
-            return True
+            finally:
+                cur.close()
+                db.close()
 
-        except psycopg2.IntegrityError:
-
-            db.rollback()
-
-            return False
-
-        except Exception as error:
-
-            db.rollback()
-
-            print(
-                "❌ Database save error:",
-                error
-            )
-
-            return False
-
-        finally:
-
-            cur.close()
-            db.close()
+    except Exception as error:
+        print("❌ Change name error:", error)
+        return False
 
 
 def get_name(user_id):
 
     with db_lock:
-
         db = get_db()
         cur = db.cursor()
 
         try:
-
             cur.execute(
-                """
-                SELECT name
-                FROM users
-                WHERE user_id = %s
-                """,
+                "SELECT name FROM users WHERE user_id = %s",
                 (user_id,)
             )
 
             result = cur.fetchone()
 
-        finally:
+            if result:
+                return result[0]
 
+            return "بازیکن"
+
+        finally:
             cur.close()
             db.close()
 
-    if result:
-        return result[0]
 
-    return "بازیکن"
-
-
-def add_score(
-    user_id,
-    points
-):
+def add_score(user_id, points):
 
     with db_lock:
-
         db = get_db()
         cur = db.cursor()
 
         try:
-
             cur.execute("""
                 UPDATE users
                 SET score = score + %s
@@ -347,7 +293,6 @@ def add_score(
             db.commit()
 
         finally:
-
             cur.close()
             db.close()
 
@@ -355,53 +300,33 @@ def add_score(
 def get_leaderboard_text():
 
     with db_lock:
-
         db = get_db()
         cur = db.cursor()
 
         try:
-
             cur.execute("""
-                SELECT
-                    name,
-                    score
+                SELECT name, score
                 FROM users
-                ORDER BY
-                    score DESC,
-                    name ASC
+                ORDER BY score DESC, name ASC
                 LIMIT 10
             """)
 
             rows = cur.fetchall()
 
         finally:
-
             cur.close()
             db.close()
 
     if not rows:
+        return "🏆 هنوز کسی در جدول امتیازات نیست."
 
-        return (
-            "🏆 هنوز بازیکنی در جدول "
-            "امتیازات وجود ندارد."
-        )
+    medals = ["🥇", "🥈", "🥉"]
 
-    text = (
-        "🏆 جدول برترین بازیکنان\n\n"
-    )
-
-    medals = [
-        "🥇",
-        "🥈",
-        "🥉"
-    ]
+    text = "🏆 جدول برترین بازیکنان\n\n"
 
     for index, row in enumerate(rows, 1):
 
-        if index <= 3:
-            icon = medals[index - 1]
-        else:
-            icon = f"{index}."
+        icon = medals[index - 1] if index <= 3 else f"{index}."
 
         text += (
             f"{icon} {row[0]}\n"
@@ -412,17 +337,12 @@ def get_leaderboard_text():
 
 
 # =====================================================
-# ارتباط با API بله
+# API بله
 # =====================================================
 
-def api_request(
-    method,
-    payload=None,
-    timeout=30
-):
+def api_request(method, payload=None, timeout=30):
 
     try:
-
         response = requests.post(
             f"{BASE_URL}/{method}",
             json=payload or {},
@@ -431,55 +351,31 @@ def api_request(
 
         data = response.json()
 
-        if (
-            response.status_code != 200
-            or not data.get("ok")
-        ):
-
-            print(
-                f"❌ API Error [{method}]:",
-                data
-            )
-
+        if response.status_code != 200 or not data.get("ok"):
+            print(f"❌ API Error [{method}]:", data)
             return None
 
         return data
 
     except Exception as error:
-
-        print(
-            f"❌ Request Error [{method}]:",
-            error
-        )
-
+        print(f"❌ API Request Error [{method}]:", error)
         return None
 
 
-def send_message(
-    chat_id,
-    text,
-    reply_markup=None
-):
+def send_message(chat_id, text, reply_markup=None):
 
     payload = {
         "chat_id": chat_id,
         "text": text
     }
 
-    if reply_markup:
+    if reply_markup is not None:
         payload["reply_markup"] = reply_markup
 
-    return api_request(
-        "sendMessage",
-        payload
-    )
+    return api_request("sendMessage", payload)
 
 
-def send_photo(
-    chat_id,
-    photo,
-    caption=None
-):
+def send_photo(chat_id, photo, caption=None):
 
     payload = {
         "chat_id": chat_id,
@@ -487,19 +383,12 @@ def send_photo(
     }
 
     if caption:
-        payload["caption"] = caption
+        payload["caption"] = caption[:1024]
 
-    return api_request(
-        "sendPhoto",
-        payload
-    )
+    return api_request("sendPhoto", payload)
 
 
-def send_voice(
-    chat_id,
-    voice,
-    caption=None
-):
+def send_voice(chat_id, voice, caption=None):
 
     payload = {
         "chat_id": chat_id,
@@ -507,18 +396,12 @@ def send_voice(
     }
 
     if caption:
-        payload["caption"] = caption
+        payload["caption"] = caption[:1024]
 
-    return api_request(
-        "sendVoice",
-        payload
-    )
+    return api_request("sendVoice", payload)
 
 
-def answer_callback(
-    callback_id,
-    text=None
-):
+def answer_callback(callback_id, text=None):
 
     payload = {
         "callback_query_id": callback_id
@@ -534,112 +417,94 @@ def answer_callback(
 
 
 # =====================================================
-# تشخیص رسانه
+# تشخیص متن، عکس و ویس
 # =====================================================
 
-def get_media_from_message(message):
+def get_content_from_message(message):
 
     photos = message.get("photo")
 
     if photos:
-
         try:
-
             photo = photos[-1]
-
             file_id = photo.get("file_id")
 
             if file_id:
-
                 return {
                     "type": "photo",
                     "file_id": file_id,
                     "caption": (
-                        message.get(
-                            "caption",
-                            ""
-                        ).strip()
-                    )
+                        message.get("caption", "") or ""
+                    ).strip()
                 }
-
         except Exception:
             pass
-
 
     voice = message.get("voice")
 
     if voice:
-
         try:
-
             file_id = voice.get("file_id")
 
             if file_id:
-
                 return {
                     "type": "voice",
                     "file_id": file_id,
                     "caption": (
-                        message.get(
-                            "caption",
-                            ""
-                        ).strip()
-                    )
+                        message.get("caption", "") or ""
+                    ).strip()
                 }
-
         except Exception:
             pass
+
+    text = (message.get("text", "") or "").strip()
+
+    if text:
+        return {
+            "type": "text",
+            "text": text[:4000]
+        }
 
     return None
 
 
-def send_media(
-    chat_id,
-    media,
-    prefix=None
-):
+def send_content(chat_id, content, prefix=None):
 
-    if not media:
+    if not content:
         return
 
-    media_type = media.get("type")
+    content_type = content.get("type")
 
-    file_id = media.get("file_id")
+    if content_type == "text":
 
-    caption = media.get(
-        "caption",
-        ""
-    )
+        text = content.get("text", "")
 
-    if not file_id:
+        if prefix:
+            text = f"{prefix}\n\n{text}"
+
+        send_message(chat_id, text)
         return
+
+    caption = content.get("caption", "")
 
     if prefix:
+        caption = (
+            f"{prefix}\n\n{caption}"
+            if caption
+            else prefix
+        )
 
-        if caption:
-
-            caption = (
-                f"{prefix}\n\n"
-                f"{caption}"
-            )
-
-        else:
-
-            caption = prefix
-
-    if media_type == "photo":
-
+    if content_type == "photo":
         send_photo(
             chat_id,
-            file_id,
+            content.get("file_id"),
             caption
         )
 
-    elif media_type == "voice":
-
+    elif content_type == "voice":
         send_voice(
             chat_id,
-            file_id,
+            content.get("file_id"),
             caption
         )
 
@@ -652,28 +517,22 @@ def get_main_menu():
 
     return {
         "keyboard": [
-
             [
                 {"text": "🎮 اتاق‌های آنلاین"},
                 {"text": "🤖 بازی تک‌نفره"}
             ],
-
             [
                 {"text": "🏆 جدول امتیازات"},
                 {"text": "✏️ تغییر نام"}
             ],
-
             [
                 {"text": "📖 راهنمای بازی"}
             ],
-
             [
                 {"text": "📢 کانال اطلاع‌رسانی"},
                 {"text": "💬 پشتیبانی"}
             ]
-
         ],
-
         "resize_keyboard": True
     }
 
@@ -682,22 +541,17 @@ def get_rooms_menu():
 
     return {
         "keyboard": [
-
             [
                 {"text": "🛠️ ساخت اتاق جدید"},
                 {"text": "🚪 پیوستن به اتاق"}
             ],
-
             [
                 {"text": "🚪 خروج از اتاق"}
             ],
-
             [
                 {"text": "🏠 منوی اصلی"}
             ]
-
         ],
-
         "resize_keyboard": True
     }
 
@@ -706,35 +560,36 @@ def get_modes_keyboard():
 
     return {
         "inline_keyboard": [
-
             [
                 {
                     "text": "🟢 معمولی و دوستانه",
                     "callback_data": "mode_normal"
                 }
             ],
-
             [
                 {
                     "text": "🔥 خفن و چالشی",
                     "callback_data": "mode_fun"
                 }
             ],
-
             [
                 {
-                    "text": "👻 مرموز و معمایی",
-                    "callback_data": "mode_scary"
+                    "text": "⛏️ ماینکرفت",
+                    "callback_data": "mode_minecraft"
                 }
             ],
-
+            [
+                {
+                    "text": "⚡ سریع جواب بده",
+                    "callback_data": "mode_fast"
+                }
+            ],
             [
                 {
                     "text": "🔙 بازگشت",
                     "callback_data": "back_menu"
                 }
             ]
-
         ]
     }
 
@@ -743,23 +598,19 @@ def get_single_next_keyboard():
 
     return {
         "keyboard": [
-
             [
                 {"text": "⏭️ سؤال جدید"}
             ],
-
             [
                 {"text": "🏠 منوی اصلی"}
             ]
-
         ],
-
         "resize_keyboard": True
     }
 
 
 # =====================================================
-# بانک سؤال‌ها
+# بانک کامل‌تر سؤال‌ها و چالش‌ها
 # =====================================================
 
 PROMPTS = {
@@ -767,33 +618,57 @@ PROMPTS = {
     "normal": {
 
         "truth": [
-
-            "آخرین باری که از ته دل خندیدی چه زمانی بود؟",
-
-            "اگر می‌توانستی یک مهارت جدید یاد بگیری، چه بود؟",
-
-            "بهترین خاطره مدرسه‌ات چیست؟",
-
-            "چه چیزی خیلی زود خوشحالت می‌کند؟",
-
-            "اگر یک روز قدرت نامرئی شدن داشتی، چه کار جالبی انجام می‌دادی؟",
-
-            "کدام شخصیت کارتونی را بیشتر دوست داری؟"
-
+            "از بین کسایی که اینجا هستن، به کی بیشتر اعتماد داری و چرا؟",
+            "آخرین بار کی دروغ گفتی و چرا؟",
+            "اگر جای یکی از بچه‌های این گروه بودی، کی رو انتخاب می‌کردی؟",
+            "چیزی که تا حالا به کسی نگفتی ولی دوست داری بگی چیه؟",
+            "آخرین بار کی گریه کردی و چرا؟",
+            "بامزه‌ترین خاطره‌ات از مدرسه چیه؟",
+            "بدترین غذایی که تا حالا خوردی چی بود؟",
+            "اگر فقط یک چیز را تا آخر عمر می‌توانستی استفاده کنی، چی بود؟",
+            "آیا تا حالا از کاری که کردی پشیمون شدی؟",
+            "اگر بفهمی بهترین دوستت پشت سرت حرف زده، چیکار می‌کنی؟",
+            "یک چیزی که در خودت واقعاً دوست داری چیه؟",
+            "اگر یک روز نامرئی می‌شدی، اولین کاری که می‌کردی چی بود؟",
+            "چیزی که باعث می‌شه سریع عصبانی بشی چیه؟",
+            "آخرین بار کی از یک دوستت دلخور شدی و چرا؟",
+            "بزرگ‌ترین ترست چیه؟",
+            "اگر یک فرصت داشتی گذشته را عوض کنی، چه چیزی را انتخاب می‌کردی؟",
+            "بزرگ‌ترین اشتباهی که در مورد یک دوست کردی چی بوده؟",
+            "کدوم ویژگی اخلاقی خودت رو دوست داری تغییر بدی؟",
+            "آیا تا حالا از موفقیت یکی از دوستات حسودی کردی؟",
+            "اگر پول مهم نبود، الان مشغول چه کاری بودی؟",
+            "بزرگ‌ترین ضعف اخلاقی خودت رو بگو.",
+            "اگر می‌توانستی یک روز از زندگی یک نفر دیگر را تجربه کنی، کی را انتخاب می‌کردی؟",
+            "بزرگ‌ترین فداکاری‌ای که تا حالا برای کسی کردی چی بوده؟",
+            "آخرین آهنگی که گوش دادی چی بود؟",
+            "یک عادت بد یا بامزه خودت را بگو.",
+            "یک شهر نام ببر که دوست داری به آن سفر کنی.",
+            "اگر یک ابرقدرت داشتی، چه قدرتی انتخاب می‌کردی؟",
+            "بهترین بازی ویدیویی که انجام دادی چیست؟",
+            "یک خاطره خجالت‌آور اما بی‌خطر و بامزه تعریف کن."
         ],
 
         "dare": [
-
-            "یک داستان خنده‌دار سه‌خطی بنویس.",
-
-            "نام پنج میوه را بنویس.",
-
-            "یک معمای ساده بساز.",
-
-            "یک شعر کوتاه و بامزه بنویس.",
-
-            "یک جمله با پنج کلمه بنویس."
-
+            "با لهجه محلی، سه جمله درباره مدرسه‌ات بگو.",
+            "یک داستان مرموز کوتاه تعریف کن.",
+            "یک ایموجی بفرست که حالت الان را نشان بده و توضیح بده چرا.",
+            "با آواز یا شعر بگو امروز چیکار کردی.",
+            "از یک نفر در گروه یک تعریف واقعی و محترمانه بکن.",
+            "یک جمله بگو که آخرش همه بخندن.",
+            "یک جمله بگو که توش «مدرسه»، «فیل» و «برف» باشد.",
+            "یک سؤال بپرس که جوابش بقیه را غافلگیر کند.",
+            "یک اسم بامزه برای خودت انتخاب کن و دلیلش را بگو.",
+            "یک لطیفه کوتاه و مناسب تعریف کن.",
+            "با سه ایموجی یک داستان بساز.",
+            "یک شخصیت خیالی بساز و سه ویژگی برایش بگو.",
+            "یک اسم عجیب برای یک فیلم خیالی انتخاب کن.",
+            "یک معمای کوتاه برای بقیه طراحی کن.",
+            "یک جمله کاملاً عجیب ولی خنده‌دار بساز.",
+            "یک پیام انگیزشی کوتاه برای اعضای گروه بنویس.",
+            "یک شعر کوتاه و بامزه بساز.",
+            "ده اسم ایرانی بگو که با «پ» شروع می‌شوند.",
+            "سه خوراکی محبوب و یک خوراکی که خودت دوست نداری نام ببر."
         ]
     },
 
@@ -801,101 +676,129 @@ PROMPTS = {
     "fun": {
 
         "truth": [
-
-            "عجیب‌ترین غذایی که امتحان کرده‌ای چه بوده؟",
-
-            "اگر مدیر مدرسه بودی چه قانونی می‌گذاشتی؟",
-
-            "اگر یک قدرت خیالی داشتی، چه بود؟",
-
-            "خنده‌دارترین اتفاقی که در یک بازی برایت افتاده چیست؟"
-
+            "کی از همه بیشتر دیر می‌رسد؟",
+            "کی از همه بامزه‌تر است؟",
+            "کی زودتر از همه عصبی می‌شود؟",
+            "کی بهترین تایپیست است؟",
+            "کی بیشتر در گروه ساکت است ولی در واقعیت پرحرف‌تر است؟",
+            "اگر یک نفر را قهرمان گروه می‌کردی، کی بود؟",
+            "اگر یک نفر در گروه شخصیت فیلم بود، چه نقشی می‌گرفت؟",
+            "اگر یک نفر یک رنگ بود، چه رنگی می‌شد؟",
+            "اگر یک نفر یک فصل بود، کدام فصل بود؟",
+            "اگر یک نفر یک کتاب بود، اسم کتابش چی بود؟",
+            "توی گوشی‌ات چند تا بازی داری و کدام را بیشتر بازی می‌کنی؟",
+            "اگر مدیر مدرسه بودی چه قانونی می‌گذاشتی؟"
         ],
 
         "dare": [
-
-            "یک جمله خنده‌دار با سه ایموجی بساز.",
-
-            "یک لطیفه کوتاه و مناسب تعریف کن.",
-
+            "یک نفر را انتخاب کن و یک ویژگی مثبت او را بگو.",
+            "برای یکی از اعضای گروه یک لقب دوستانه و محترمانه بساز.",
             "یک تبلیغ بامزه برای یک مداد بنویس.",
-
-            "یک داستان کوتاه و خنده‌دار بساز."
-
+            "یک داستان پنج‌کلمه‌ای بنویس.",
+            "یک قانون عجیب برای یک مدرسه خیالی پیشنهاد بده.",
+            "یک اسم بامزه برای یک فروشگاه خیالی بساز.",
+            "یک داستان کوتاه و خنده‌دار بساز.",
+            "یک تعریف صادقانه و محترمانه از یکی از اعضای گروه بکن.",
+            "یک معمای کوتاه طراحی کن.",
+            "یک جمله خنده‌دار با سه ایموجی بساز."
         ]
     },
 
 
-    "scary": {
+    "minecraft": {
 
         "truth": [
-
-            "کدام صدا در شب بیشتر غافلگیرت می‌کند؟",
-
-            "اگر در یک داستان معمایی بودی، چه نقشی انتخاب می‌کردی؟",
-
-            "بهترین داستان معمایی که شنیده‌ای چه بوده؟"
-
+            "تا حالا چند ساعت پشت سر هم ماینکرفت بازی کردی؟",
+            "آخرین باری که در ماینکرفت باختی یا شکست خوردی کی بود؟",
+            "اگر می‌توانستی یک بلاک ماینکرفت را واقعی کنی، چی می‌شد؟",
+            "اولین خانه‌ای که در ماینکرفت ساختی چه شکلی بود؟",
+            "Survival را بیشتر دوست داری یا Creative؟",
+            "بامزه‌ترین اتفاقی که در ماینکرفت برایت افتاده چی بوده؟",
+            "به نظر تو سخت‌ترین دشمن ماینکرفت کدام است؟",
+            "بهترین سازه‌ای که تا حالا ساختی چی بوده؟",
+            "اگر یک Biome جدید اضافه می‌کردی چه شکلی بود؟",
+            "اگر می‌توانستی یک موجود جدید به ماینکرفت اضافه کنی، چه چیزی بود؟"
         ],
 
         "dare": [
+            "در ۲۰ ثانیه توضیح بده چرا Creeper معروف است.",
+            "یک اسم بامزه برای یک دنیای جدید ماینکرفت بساز.",
+            "یک چالش ماینکرفت پیشنهاد بده که همه انجام بدهند.",
+            "پنج ابزار ماینکرفت را نام ببر.",
+            "یک دشمن جدید برای ماینکرفت اختراع کن.",
+            "یک مأموریت بامزه برای بازیکنان ماینکرفت طراحی کن.",
+            "یک اسم خنده‌دار برای یک سرور ماینکرفت پیشنهاد بده.",
+            "یک داستان کوتاه درباره یک ماجراجویی در ماینکرفت تعریف کن."
+        ]
+    },
 
-            "یک داستان مرموز سه‌خطی بنویس.",
 
-            "یک اسم جالب برای یک خانه خیالی انتخاب کن.",
+    "fast": {
 
-            "یک معمای مرموز طراحی کن."
+        "truth": [
+            "[۱۰ ثانیه] اسم سه رنگ بگو.",
+            "[۱۵ ثانیه] پنج بازی ویدیویی نام ببر.",
+            "[۲۰ ثانیه] چهار استان ایران نام ببر.",
+            "[۱۰ ثانیه] سه میوه قرمز نام ببر.",
+            "[۱۵ ثانیه] پنج ابزار ماینکرفت نام ببر.",
+            "[۱۰ ثانیه] سه حیوان نام ببر.",
+            "[۱۵ ثانیه] پنج شخصیت کارتونی نام ببر.",
+            "[۱۰ ثانیه] سه خوراکی شیرین نام ببر."
+        ],
 
+        "dare": [
+            "[۱۰ ثانیه] یک جمله خنده‌دار بساز.",
+            "[۱۵ ثانیه] پنج اسم برای یک ربات خیالی پیشنهاد بده.",
+            "[۱۰ ثانیه] سه ایموجی بفرست که یک داستان بسازند.",
+            "[۲۰ ثانیه] چهار بازی محبوب نام ببر.",
+            "[۱۵ ثانیه] پنج میوه را بدون تکرار نام ببر.",
+            "[۱۰ ثانیه] یک معمای کوتاه بگو."
         ]
     }
-
 }
 
 
-def get_random_prompt(
-    mode,
-    question_type
-):
+def get_random_prompt(mode):
 
     mode_data = PROMPTS.get(
         mode,
         PROMPTS["normal"]
     )
 
-    prompts = mode_data.get(
-        question_type,
-        []
-    )
+    all_prompts = []
 
-    if not prompts:
-        return "یک سؤال یا چالش مناسب انجام بده."
+    for question_type in ["truth", "dare"]:
 
-    return random.choice(prompts)
+        for prompt in mode_data.get(question_type, []):
+
+            all_prompts.append({
+                "type": question_type,
+                "prompt": prompt
+            })
+
+    if not all_prompts:
+        return {
+            "type": "truth",
+            "prompt": "یک سؤال مناسب پاسخ بده."
+        }
+
+    return random.choice(all_prompts)
 
 
 def mode_name(mode):
 
     names = {
-
-        "normal":
-            "معمولی و دوستانه",
-
-        "fun":
-            "خفن و چالشی",
-
-        "scary":
-            "مرموز و معمایی"
-
+        "normal": "🟢 معمولی و دوستانه",
+        "fun": "🔥 خفن و چالشی",
+        "minecraft": "⛏️ ماینکرفت",
+        "fast": "⚡ سریع جواب بده"
     }
 
-    return names.get(
-        mode,
-        "معمولی"
-    )
+    return names.get(mode, "🟢 معمولی")
 
 
 # =====================================================
-# بازی تک نفره
+# بازی تک‌نفره
 # =====================================================
 
 def start_single_game(chat_id):
@@ -907,58 +810,45 @@ def start_single_game(chat_id):
         if not game:
             return
 
-        question_type = random.choice([
-            "truth",
-            "dare"
-        ])
-
-        prompt = get_random_prompt(
-            game["mode"],
-            question_type
+        selected = get_random_prompt(
+            game["mode"]
         )
 
-        game["question_type"] = question_type
-        game["prompt"] = prompt
+        game["question_type"] = selected["type"]
+        game["prompt"] = selected["prompt"]
         game["waiting_answer"] = True
 
+        mode = game["mode"]
 
-    if question_type == "truth":
+    title = (
+        "🎯 حقیقت"
+        if selected["type"] == "truth"
+        else "🔥 جرئت"
+    )
 
-        title = "🎯 حقیقت"
-
-        instruction = (
-            "به سؤال پاسخ بده."
-        )
-
-    else:
-
-        title = "🔥 جرئت"
-
-        instruction = (
-            "چالش را انجام بده و پاسخ یا نتیجه را ارسال کن."
-        )
-
+    instruction = (
+        "به سؤال پاسخ بده."
+        if selected["type"] == "truth"
+        else "چالش را انجام بده و پاسخ یا نتیجه را ارسال کن."
+    )
 
     send_message(
         chat_id,
         (
             "🤖 بازی تک‌نفره\n\n"
-            f"🎮 حالت: {mode_name(game['mode'])}\n\n"
+            f"🎮 حالت: {mode_name(mode)}\n\n"
             f"{title}\n\n"
-            f"📝 {prompt}\n\n"
+            f"📝 {selected['prompt']}\n\n"
             f"✍️ {instruction}\n\n"
-            "ℹ️ این بخش صرفاً برای سرگرمی است "
-            "و امتیازی ندارد."
+            "📩 می‌توانی متن، عکس یا ویس ارسال کنی.\n\n"
+            "ℹ️ این بخش امتیازدهی ندارد."
         ),
         {
             "keyboard": [
-
                 [
                     {"text": "🏠 منوی اصلی"}
                 ]
-
             ],
-
             "resize_keyboard": True
         }
     )
@@ -970,21 +860,17 @@ def finish_single_game(chat_id):
 
         game = single_player.get(chat_id)
 
-        if not game:
-            return
-
-        if not game.get("waiting_answer"):
+        if not game or not game.get("waiting_answer"):
             return
 
         game["waiting_answer"] = False
 
-
     send_message(
         chat_id,
         (
-            "✅ پاسخ شما ثبت شد.\n\n"
+            "✅ پاسخ دریافت شد.\n\n"
             "🎮 در بازی تک‌نفره امتیازی داده نمی‌شود.\n\n"
-            "برای ادامه، سؤال جدید را انتخاب کن."
+            "برای ادامه سؤال جدید را انتخاب کن."
         ),
         get_single_next_keyboard()
     )
@@ -996,166 +882,97 @@ def finish_single_game(chat_id):
 
 def generate_room_code():
 
-    with room_lock:
+    for _ in range(100):
+        code = str(random.randint(1000, 9999))
 
-        for _ in range(100):
-
-            code = str(
-                random.randint(
-                    1000,
-                    9999
-                )
-            )
-
-            if code not in rooms:
-                return code
+        if code not in rooms:
+            return code
 
     return None
 
 
 def find_player_room(user_id):
 
-    with room_lock:
+    for code, room in rooms.items():
 
-        for code, room in rooms.items():
-
-            if user_id in room.get(
-                "players",
-                []
-            ):
-
-                return code, room
+        if user_id in room.get("players", []):
+            return code, room
 
     return None, None
 
 
-def reset_round_data(room):
+def reset_round(room):
 
     room["questioner"] = None
     room["answerer"] = None
-
     room["question_type"] = None
-
     room["question"] = None
-
     room["answer"] = None
-
     room["votes"] = {}
-
     room["eligible_voters"] = []
-
     room["vote_finished"] = False
 
-    room["vote_end_time"] = None
 
-
-def create_room(
-    chat_id,
-    mode
-):
+def create_room(chat_id, mode):
 
     with room_lock:
 
-        old_code, old_room = find_player_room(
-            chat_id
-        )
+        old_code, old_room = find_player_room(chat_id)
 
         if old_room:
+            send_message(
+                chat_id,
+                "⚠️ شما در حال حاضر عضو یک اتاق هستید."
+            )
+            return
 
-            already_in_room = True
+        code = generate_room_code()
 
-        else:
+        if not code:
+            send_message(
+                chat_id,
+                "❌ ساخت اتاق انجام نشد."
+            )
+            return
 
-            already_in_room = False
-
-            code = generate_room_code()
-
-            if not code:
-
-                code = None
-
-            else:
-
-                rooms[code] = {
-
-                    "host": chat_id,
-
-                    "players": [
-                        chat_id
-                    ],
-
-                    "mode": mode,
-
-                    "phase": "waiting",
-
-                    "round": 0,
-
-                    "questioner": None,
-
-                    "answerer": None,
-
-                    "question_type": None,
-
-                    "question": None,
-
-                    "answer": None,
-
-                    "votes": {},
-
-                    "eligible_voters": [],
-
-                    "vote_finished": False,
-
-                    "vote_end_time": None
-
-                }
-
-
-    if already_in_room:
-
-        send_message(
-            chat_id,
-            "⚠️ شما در حال حاضر عضو یک اتاق هستید."
-        )
-
-        return
-
-
-    if not code:
-
-        send_message(
-            chat_id,
-            "❌ ساخت اتاق انجام نشد. دوباره تلاش کن."
-        )
-
-        return
-
+        rooms[code] = {
+            "host": chat_id,
+            "players": [chat_id],
+            "mode": mode,
+            "phase": "waiting",
+            "round": 0,
+            "questioner": None,
+            "answerer": None,
+            "question_type": None,
+            "question": None,
+            "answer": None,
+            "votes": {},
+            "eligible_voters": [],
+            "vote_finished": False
+        }
 
     send_message(
         chat_id,
         (
-            "✅ اتاق با موفقیت ساخته شد!\n\n"
+            "✅ اتاق ساخته شد!\n\n"
             f"🔢 کد اتاق: {code}\n"
             f"🎮 حالت: {mode_name(mode)}\n\n"
-            "👥 منتظر ورود بازیکنان باش."
+            "کد اتاق را برای دوستانت بفرست."
         ),
         {
             "inline_keyboard": [
-
                 [
                     {
                         "text": "🚀 شروع بازی",
-                        "callback_data": f"start_room_{code}"
+                        "callback_data": f"start_{code}"
                     }
                 ],
-
                 [
                     {
                         "text": "🗑️ حذف اتاق",
-                        "callback_data": f"delete_room_{code}"
+                        "callback_data": f"delete_{code}"
                     }
                 ]
-
             ]
         }
     )
@@ -1165,60 +982,35 @@ def list_rooms(chat_id):
 
     with room_lock:
 
-        room_list = []
+        available = [
+            (
+                code,
+                room
+            )
+            for code, room in rooms.items()
+            if room.get("phase") == "waiting"
+        ]
 
-        for code, room in rooms.items():
-
-            if room.get("phase") == "waiting":
-
-                room_list.append(
-                    (
-                        code,
-                        len(room.get("players", [])),
-                        room.get("mode")
-                    )
-                )
-
-
-    if not room_list:
-
+    if not available:
         send_message(
             chat_id,
-            "❌ در حال حاضر اتاقی برای پیوستن وجود ندارد."
+            "📭 فعلاً اتاقی برای پیوستن وجود ندارد."
         )
-
         return
-
 
     keyboard = []
 
-    for code, count, mode in room_list:
+    for code, room in available:
 
         keyboard.append([
-
             {
                 "text": (
                     f"🚪 اتاق {code} | "
-                    f"{count} نفر | "
-                    f"{mode_name(mode)}"
+                    f"{len(room['players'])} نفر"
                 ),
-
-                "callback_data":
-                    f"join_room_{code}"
+                "callback_data": f"join_{code}"
             }
-
         ])
-
-
-    keyboard.append([
-
-        {
-            "text": "🔙 بازگشت",
-            "callback_data": "back_menu"
-        }
-
-    ])
-
 
     send_message(
         chat_id,
@@ -1233,115 +1025,50 @@ def leave_room(chat_id):
 
     with room_lock:
 
-        code, room = find_player_room(
-            chat_id
-        )
+        code, room = find_player_room(chat_id)
 
         if not room:
-
             found = False
-
         else:
-
             found = True
 
-            players = room.get(
-                "players",
-                []
-            )
+            if chat_id in room["players"]:
+                room["players"].remove(chat_id)
 
-            if chat_id in players:
+            players = list(room["players"])
 
-                players.remove(chat_id)
+            if room["host"] == chat_id and players:
+                room["host"] = players[0]
 
-            # اگر میزبان خارج شد
-            if room.get("host") == chat_id:
-
-                if players:
-
-                    room["host"] = players[0]
-
-                    new_host = room["host"]
-
-                else:
-
-                    new_host = None
-
-            else:
-
-                new_host = room.get("host")
-
-
-            # اگر تعداد افراد کمتر از 2 شد
             if len(players) < 2:
+                room["phase"] = "waiting"
+                reset_round(room)
 
-                if room.get("phase") != "waiting":
-
-                    room["phase"] = "waiting"
-
-                    reset_round_data(room)
-
-
-            remaining_players = list(players)
-
-            # حذف کامل اتاق
-            if not remaining_players:
-
+            if not players:
                 del rooms[code]
 
-
     if not found:
-
         send_message(
             chat_id,
-            "⚠️ شما در هیچ اتاقی حضور ندارید."
+            "⚠️ شما داخل هیچ اتاقی نیستید."
         )
-
         return
-
 
     send_message(
         chat_id,
-        "🚪 شما از اتاق خارج شدید.",
+        "🚪 از اتاق خارج شدی.",
         get_main_menu()
     )
 
-
-    for player in remaining_players:
-
+    for player in players:
         send_message(
             player,
-            (
-                f"👋 {get_name(chat_id)} "
-                "از اتاق خارج شد."
-            )
+            f"👋 {get_name(chat_id)} از اتاق خارج شد."
         )
-
-
-    if new_host and new_host != chat_id:
-
-        send_message(
-            new_host,
-            "👑 شما میزبان جدید اتاق هستید."
-        )
-
-
-    if remaining_players and len(remaining_players) < 2:
-
-        for player in remaining_players:
-
-            send_message(
-                player,
-                (
-                    "⚠️ تعداد بازیکنان برای ادامه بازی "
-                    "کافی نیست.\n"
-                    "بازی متوقف شد."
-                )
-            )
 
 
 # =====================================================
-# شروع دور آنلاین
+# بازی آنلاین
 # =====================================================
 
 def start_online_round(code):
@@ -1353,27 +1080,20 @@ def start_online_round(code):
         if not room:
             return
 
-        players = list(
-            room.get("players", [])
-        )
+        players = list(room["players"])
 
         if len(players) < 2:
-
             room["phase"] = "waiting"
-
-            reset_round_data(room)
-
+            reset_round(room)
             return
 
-
-        # جلوگیری از شروع دور در وضعیت نامعتبر
-        if room.get("phase") not in [
+        if room["phase"] not in [
             "waiting",
             "between_rounds"
         ]:
-
             return
 
+        reset_round(room)
 
         room["round"] += 1
 
@@ -1382,22 +1102,17 @@ def start_online_round(code):
             2
         )
 
-        reset_round_data(room)
-
         room["questioner"] = questioner
         room["answerer"] = answerer
-
         room["phase"] = "choosing_type"
 
         round_number = room["round"]
 
-
-    message = (
+    base_text = (
         f"🎮 دور {round_number}\n\n"
-        f"✍️ پرسش‌کننده: {get_name(questioner)}\n\n"
+        f"✍️ پرسش‌کننده: {get_name(questioner)}\n"
         f"🎯 پاسخ‌دهنده: {get_name(answerer)}"
     )
-
 
     for player in players:
 
@@ -1406,46 +1121,36 @@ def start_online_round(code):
             send_message(
                 player,
                 (
-                    message +
-                    "\n\n🎯 انتخاب کن:\n"
-                    "حقیقت یا جرئت؟"
+                    base_text +
+                    "\n\n🎯 انتخاب کن:"
                 ),
                 {
                     "inline_keyboard": [
-
                         [
                             {
                                 "text": "🎯 حقیقت",
                                 "callback_data": f"truth_{code}"
                             },
-
                             {
                                 "text": "🔥 جرئت",
                                 "callback_data": f"dare_{code}"
                             }
-
                         ]
-
                     ]
                 }
             )
 
         else:
-
             send_message(
                 player,
                 (
-                    message +
+                    base_text +
                     "\n\n⏳ منتظر انتخاب پاسخ‌دهنده باش."
                 )
             )
 
 
-# =====================================================
-# ارسال سؤال آنلاین
-# =====================================================
-
-def send_online_question(code):
+def publish_question(code):
 
     with room_lock:
 
@@ -1454,80 +1159,59 @@ def send_online_question(code):
         if not room:
             return
 
-        if room.get("phase") != "waiting_question":
+        if room["phase"] != "waiting_question":
             return
 
         question = room.get("question")
 
-        if question is None:
+        if not question:
             return
 
         room["phase"] = "waiting_answer"
 
-        players = list(
-            room.get("players", [])
-        )
+        players = list(room["players"])
+        questioner = room["questioner"]
+        answerer = room["answerer"]
+        question_type = room["question_type"]
 
-        questioner = room.get("questioner")
-
-        answerer = room.get("answerer")
-
-
-    header = (
-        "📢 سؤال یا چالش جدید\n\n"
-        f"✍️ پرسش‌کننده: {get_name(questioner)}\n\n"
-        f"🎯 پاسخ‌دهنده: {get_name(answerer)}"
+    choice_text = (
+        "🎯 حقیقت"
+        if question_type == "truth"
+        else "🔥 جرئت"
     )
 
+    prefix = (
+        f"📢 {choice_text}\n\n"
+        f"✍️ پرسش‌کننده: {get_name(questioner)}\n"
+        f"🎯 پاسخ‌دهنده: {get_name(answerer)}\n\n"
+        "❓ سؤال یا چالش:"
+    )
 
     for player in players:
 
-        if isinstance(question, dict):
-
-            send_message(
-                player,
-                header
-            )
-
-            send_media(
-                player,
-                question
-            )
-
-        else:
-
-            send_message(
-                player,
-                (
-                    header +
-                    f"\n\n📝 {question}"
-                )
-            )
-
+        send_content(
+            player,
+            question,
+            prefix
+        )
 
         if player == answerer:
-
             send_message(
                 player,
                 (
-                    "💬 حالا پاسخ خود را به صورت "
-                    "متن، عکس یا ویس ارسال کن."
+                    "📩 حالا پاسخ خودت را ارسال کن.\n\n"
+                    "می‌توانی متن، عکس یا ویس بفرستی."
                 )
             )
 
         else:
-
             send_message(
                 player,
-                "⏳ منتظر پاسخ باش."
+                "⏳ منتظر پاسخ بازیکن باش."
             )
 
 
-# =====================================================
-# شروع رأی‌گیری
-# =====================================================
-
-def start_online_voting(code):
+def publish_answer_and_start_vote(code):
 
     with room_lock:
 
@@ -1536,111 +1220,65 @@ def start_online_voting(code):
         if not room:
             return
 
-        if room.get("phase") != "waiting_answer":
+        if room["phase"] != "waiting_answer":
             return
 
         answer = room.get("answer")
 
-        if answer is None:
+        if not answer:
             return
 
+        answerer = room["answerer"]
+        players = list(room["players"])
 
-        answerer = room.get("answerer")
-
-        players = list(
-            room.get("players", [])
-        )
-
-
-        eligible_voters = [
-
+        room["eligible_voters"] = [
             player
-
             for player in players
-
             if player != answerer
-
         ]
 
-
-        room["eligible_voters"] = eligible_voters
-
         room["votes"] = {}
-
         room["vote_finished"] = False
-
-        room["vote_end_time"] = (
-            time.time() + VOTE_TIMEOUT
-        )
-
         room["phase"] = "voting"
 
+        eligible = list(room["eligible_voters"])
 
-    header = (
-        "📢 پاسخ ثبت شد!\n\n"
-        f"🎯 پاسخ‌دهنده: {get_name(answerer)}"
+    prefix = (
+        "💬 پاسخ ثبت شد!\n\n"
+        f"🎯 پاسخ‌دهنده: {get_name(answerer)}\n\n"
+        "📨 پاسخ:"
     )
 
-
     vote_keyboard = {
-
         "inline_keyboard": [
-
             [
-
                 {
                     "text": "👍 تأیید",
                     "callback_data": f"yes_{code}"
                 },
-
                 {
                     "text": "👎 رد",
                     "callback_data": f"no_{code}"
                 }
-
             ]
-
         ]
     }
 
-
     for player in players:
 
-        if isinstance(answer, dict):
-
-            send_message(
-                player,
-                header
-            )
-
-            send_media(
-                player,
-                answer
-            )
-
-        else:
-
-            send_message(
-                player,
-                (
-                    header +
-                    f"\n\n💬 پاسخ:\n{answer}"
-                )
-            )
-
+        send_content(
+            player,
+            answer,
+            prefix
+        )
 
         if player == answerer:
-
             send_message(
                 player,
-                (
-                    f"⏳ رأی‌گیری آغاز شد.\n"
-                    f"زمان رأی‌گیری: {VOTE_TIMEOUT} ثانیه"
-                )
+                "⏳ رأی‌گیری شروع شد."
             )
 
-        else:
-
+        elif player in eligible:
             send_message(
                 player,
                 (
@@ -1650,33 +1288,24 @@ def start_online_voting(code):
                 vote_keyboard
             )
 
-
-    # پایان خودکار رأی‌گیری
-    def vote_timer():
-
-        time.sleep(VOTE_TIMEOUT)
-
-        finish_online_voting(
-            code,
-            force=True
-        )
-
-
     threading.Thread(
         target=vote_timer,
+        args=(code,),
         daemon=True
     ).start()
 
 
-# =====================================================
-# ثبت رأی
-# =====================================================
+def vote_timer(code):
 
-def register_vote(
-    code,
-    user_id,
-    vote
-):
+    time.sleep(VOTE_TIMEOUT)
+
+    finish_online_voting(
+        code,
+        force=True
+    )
+
+
+def register_vote(code, user_id, vote):
 
     should_finish = False
 
@@ -1685,153 +1314,51 @@ def register_vote(
         room = rooms.get(code)
 
         if not room:
-
             status = "no_room"
 
-        elif room.get("phase") != "voting":
-
+        elif room["phase"] != "voting":
             status = "not_voting"
 
-        elif room.get("vote_finished"):
-
+        elif room["vote_finished"]:
             status = "finished"
 
-        elif user_id not in room.get(
-            "players",
-            []
-        ):
+        elif user_id not in room["eligible_voters"]:
+            status = "not_allowed"
 
-            status = "not_member"
-
-        elif user_id == room.get("answerer"):
-
-            status = "answerer"
-
-        elif user_id not in room.get(
-            "eligible_voters",
-            []
-        ):
-
-            status = "not_eligible"
-
-        elif user_id in room.get(
-            "votes",
-            {}
-        ):
-
-            status = "already_voted"
+        elif user_id in room["votes"]:
+            status = "already"
 
         else:
-
             room["votes"][user_id] = vote
-
             status = "success"
 
             if len(room["votes"]) >= len(
                 room["eligible_voters"]
             ):
-
                 should_finish = True
 
+    messages = {
+        "no_room": "❌ این اتاق وجود ندارد.",
+        "not_voting": "⚠️ رأی‌گیری فعال نیست.",
+        "finished": "⚠️ رأی‌گیری تمام شده است.",
+        "not_allowed": "⚠️ شما اجازه رأی دادن ندارید.",
+        "already": "⚠️ شما قبلاً رأی داده‌اید.",
+        "success": "✅ رأی شما ثبت شد."
+    }
 
-    # =================================================
-    # پاسخ وضعیت
-    # =================================================
-
-    if status == "no_room":
-
-        send_message(
-            user_id,
-            "❌ این اتاق دیگر وجود ندارد."
-        )
-
-        return
-
-
-    if status == "not_voting":
-
-        send_message(
-            user_id,
-            "⚠️ رأی‌گیری فعالی وجود ندارد."
-        )
-
-        return
-
-
-    if status == "finished":
-
-        send_message(
-            user_id,
-            "⚠️ رأی‌گیری تمام شده است."
-        )
-
-        return
-
-
-    if status == "not_member":
-
-        send_message(
-            user_id,
-            "⚠️ شما عضو این اتاق نیستید."
-        )
-
-        return
-
-
-    if status == "answerer":
-
-        send_message(
-            user_id,
-            "⚠️ پاسخ‌دهنده نمی‌تواند به پاسخ خودش رأی بدهد."
-        )
-
-        return
-
-
-    if status == "not_eligible":
-
-        send_message(
-            user_id,
-            "⚠️ شما اجازه رأی دادن ندارید."
-        )
-
-        return
-
-
-    if status == "already_voted":
-
-        send_message(
-            user_id,
-            "⚠️ شما قبلاً رأی داده‌اید."
-        )
-
-        return
-
-
-    if status == "success":
-
-        send_message(
-            user_id,
-            "✅ رأی شما با موفقیت ثبت شد."
-        )
-
+    send_message(
+        user_id,
+        messages.get(status, "⚠️ خطا")
+    )
 
     if should_finish:
-
         finish_online_voting(
             code,
             force=False
         )
 
 
-# =====================================================
-# پایان رأی‌گیری
-# =====================================================
-
-def finish_online_voting(
-    code,
-    force=False
-):
+def finish_online_voting(code, force=False):
 
     with room_lock:
 
@@ -1840,77 +1367,51 @@ def finish_online_voting(
         if not room:
             return
 
-
-        if room.get("phase") != "voting":
+        if room["phase"] != "voting":
             return
 
-
-        if room.get("vote_finished"):
+        if room["vote_finished"]:
             return
 
-
-        # اگر اجباری نیست و هنوز همه رأی نداده‌اند
         if not force:
-
             if len(room["votes"]) < len(
                 room["eligible_voters"]
             ):
                 return
 
-
-        # جلوگیری از اجرای دوباره
         room["vote_finished"] = True
-
         room["phase"] = "between_rounds"
 
-
-        votes = dict(
-            room.get("votes", {})
-        )
-
-        players = list(
-            room.get("players", [])
-        )
-
-        answerer = room.get("answerer")
-
+        votes = dict(room["votes"])
+        players = list(room["players"])
+        answerer = room["answerer"]
 
     yes_votes = sum(
-
         1
-
         for vote in votes.values()
-
         if vote == "yes"
-
     )
-
 
     no_votes = sum(
-
         1
-
         for vote in votes.values()
-
         if vote == "no"
-
     )
 
-
-    # =================================================
-    # نتیجه
-    # =================================================
-
-    if yes_votes > no_votes:
-
-        add_score(
-            answerer,
-            10
-        )
+    if yes_votes == 0 and no_votes == 0:
 
         result = (
-            "✅ پاسخ توسط اکثریت تأیید شد!\n"
-            "🌟 ۱۰ امتیاز به پاسخ‌دهنده اضافه شد."
+            "⏰ زمان رأی‌گیری تمام شد.\n"
+            "هیچ رأیی ثبت نشد."
+        )
+
+    elif yes_votes > no_votes:
+
+        add_score(answerer, 10)
+
+        result = (
+            "🎉 پاسخ توسط اکثریت تأیید شد!\n"
+            "⭐ ۱۰ امتیاز به پاسخ‌دهنده اضافه شد."
         )
 
     elif no_votes > yes_votes:
@@ -1927,162 +1428,130 @@ def finish_online_voting(
             "امتیازی داده نشد."
         )
 
-
-    # اگر کسی رأی نداده باشد
-    if yes_votes == 0 and no_votes == 0:
-
-        result = (
-            "⏰ زمان رأی‌گیری تمام شد.\n"
-            "هیچ رأیی ثبت نشد و امتیازی داده نشد."
-        )
-
-
-    message = (
+    result_text = (
         "📊 نتیجه رأی‌گیری\n\n"
-        f"👍 رأی تأیید: {yes_votes}\n"
-        f"👎 رأی رد: {no_votes}\n\n"
+        f"👍 تأیید: {yes_votes}\n"
+        f"👎 رد: {no_votes}\n\n"
         f"{result}\n\n"
-        "🔄 دور بعدی در حال آماده شدن است..."
+        "🔄 دور بعدی آماده می‌شود..."
     )
 
-
     for player in players:
-
         send_message(
             player,
-            message
+            result_text
         )
 
-
-    # =================================================
-    # شروع دور بعدی
-    # =================================================
-
-    def next_round():
-
-        time.sleep(3)
-
-        with room_lock:
-
-            room = rooms.get(code)
-
-            if not room:
-                return
-
-            if len(
-                room.get("players", [])
-            ) < 2:
-
-                room["phase"] = "waiting"
-
-                reset_round_data(room)
-
-                return
-
-        start_online_round(code)
-
-
     threading.Thread(
-        target=next_round,
+        target=start_next_round,
+        args=(code,),
         daemon=True
     ).start()
 
 
+def start_next_round(code):
+
+    time.sleep(3)
+
+    with room_lock:
+
+        room = rooms.get(code)
+
+        if not room:
+            return
+
+        if len(room["players"]) < 2:
+            room["phase"] = "waiting"
+            reset_round(room)
+            return
+
+    start_online_round(code)
+
+
 # =====================================================
-# دریافت پیام کاربران
+# دریافت پیام
 # =====================================================
 
 def handle_message(message):
 
-    chat = message.get(
+    chat_id = message.get(
         "chat",
         {}
-    )
-
-    chat_id = chat.get("id")
+    ).get("id")
 
     if not chat_id:
         return
 
+    content = get_content_from_message(message)
 
-    text = message.get(
-        "text",
-        ""
-    ).strip()
+    text = ""
 
+    if content and content["type"] == "text":
+        text = content["text"]
 
-    media = get_media_from_message(
-        message
-    )
-
-
-    # =================================================
-    # ثبت نام کاربر جدید
-    # =================================================
+    # -------------------------------------------------
+    # ثبت‌نام
+    # -------------------------------------------------
 
     if not user_exists(chat_id):
 
+        with state_lock:
+            state = user_states.get(chat_id)
+
         if text == "/start":
+
+            with state_lock:
+                user_states[chat_id] = "register_name"
 
             send_message(
                 chat_id,
                 (
                     "👋 سلام!\n\n"
-                    "برای شروع، یک نام مستعار انتخاب "
+                    "برای شروع یک نام مستعار انتخاب کن "
                     "و به صورت متن ارسال کن.\n\n"
-                    "⚠️ نام انتخابی نباید تکراری باشد."
+                    "⚠️ نام تکراری پذیرفته نمی‌شود."
                 )
             )
-
             return
 
+        if state != "register_name":
+
+            send_message(
+                chat_id,
+                "برای شروع ابتدا /start را ارسال کن."
+            )
+            return
 
         if not text:
 
             send_message(
                 chat_id,
-                (
-                    "👋 لطفاً برای شروع یک نام مستعار "
-                    "به صورت متن ارسال کن."
-                )
+                "⚠️ لطفاً نام را فقط به صورت متن ارسال کن."
             )
-
             return
 
-
-        new_name = normalize_name(
-            text[:40]
-        )
-
+        new_name = normalize_name(text[:40])
 
         if len(new_name) < 2:
 
             send_message(
                 chat_id,
-                "⚠️ نام باید حداقل ۲ کاراکتر داشته باشد."
+                "⚠️ نام باید حداقل ۲ کاراکتر باشد."
             )
-
             return
-
 
         if name_exists(new_name):
 
             send_message(
                 chat_id,
                 (
-                    "❌ این نام قبلاً توسط کاربر دیگری "
-                    "انتخاب شده است.\n\n"
+                    "❌ این نام قبلاً انتخاب شده است.\n\n"
                     "لطفاً نام دیگری انتخاب کن."
                 )
             )
-
             return
 
-
-        if not save_user(
-            chat_id,
-            new_name
-        ):
+        if not save_new_user(chat_id, new_name):
 
             send_message(
                 chat_id,
@@ -2091,25 +1560,25 @@ def handle_message(message):
                     "انتخاب شده است."
                 )
             )
-
             return
 
+        with state_lock:
+            user_states.pop(chat_id, None)
 
         send_message(
             chat_id,
             (
                 f"🎉 خوش آمدی {new_name}!\n\n"
-                "حساب کاربری تو با موفقیت ساخته شد."
+                "حساب کاربری تو ساخته شد."
             ),
             get_main_menu()
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # شروع
-    # =================================================
+    # -------------------------------------------------
 
     if text == "/start":
 
@@ -2117,67 +1586,39 @@ def handle_message(message):
             chat_id,
             (
                 f"👋 سلام {get_name(chat_id)}!\n\n"
-                "به بازی جرئت یا حقیقت خوش آمدی."
+                "به بازی حقیقت یا جرئت خوش آمدی."
             ),
             get_main_menu()
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # تغییر نام
-    # =================================================
+    # -------------------------------------------------
 
     with state_lock:
+        state = user_states.get(chat_id)
 
-        current_state = user_states.get(chat_id)
-
-
-    if current_state == "change_name":
-
-        if text == "🏠 منوی اصلی":
-
-            with state_lock:
-
-                user_states.pop(
-                    chat_id,
-                    None
-                )
-
-            send_message(
-                chat_id,
-                "🏠 منوی اصلی",
-                get_main_menu()
-            )
-
-            return
-
+    if state == "change_name":
 
         if not text:
 
             send_message(
                 chat_id,
-                "⚠️ لطفاً نام جدید را به صورت متن ارسال کن."
+                "⚠️ لطفاً نام را به صورت متن ارسال کن."
             )
-
             return
 
-
-        new_name = normalize_name(
-            text[:40]
-        )
-
+        new_name = normalize_name(text[:40])
 
         if len(new_name) < 2:
 
             send_message(
                 chat_id,
-                "⚠️ نام باید حداقل ۲ کاراکتر داشته باشد."
+                "⚠️ نام باید حداقل ۲ کاراکتر باشد."
             )
-
             return
-
 
         if name_exists(
             new_name,
@@ -2186,164 +1627,216 @@ def handle_message(message):
 
             send_message(
                 chat_id,
-                (
-                    "❌ این نام قبلاً توسط کاربر دیگری "
-                    "انتخاب شده است."
-                )
+                "❌ این نام قبلاً توسط کاربر دیگری انتخاب شده است."
             )
-
             return
 
-
-        if not save_user(
-            chat_id,
-            new_name
-        ):
+        if not change_user_name(chat_id, new_name):
 
             send_message(
                 chat_id,
-                "❌ تغییر نام انجام نشد. دوباره تلاش کن."
+                "❌ تغییر نام انجام نشد."
             )
-
             return
 
-
         with state_lock:
-
-            user_states.pop(
-                chat_id,
-                None
-            )
-
+            user_states.pop(chat_id, None)
 
         send_message(
             chat_id,
-            (
-                "✅ نام شما با موفقیت تغییر کرد.\n\n"
-                f"نام جدید: {new_name}"
-            ),
+            f"✅ نام جدید شما: {new_name}",
             get_main_menu()
         )
-
         return
 
 
-    # =================================================
-    # پاسخ بازی تک نفره
-    # =================================================
+    # -------------------------------------------------
+    # پاسخ بازی تک‌نفره
+    # -------------------------------------------------
 
     with state_lock:
 
-        single_game = single_player.get(
-            chat_id
-        )
+        game = single_player.get(chat_id)
 
         waiting_single = bool(
-            single_game
-            and single_game.get(
-                "waiting_answer"
-            )
+            game and game.get("waiting_answer")
         )
-
 
     if waiting_single:
 
         if text == "🏠 منوی اصلی":
 
             with state_lock:
-
-                single_player.pop(
-                    chat_id,
-                    None
-                )
-
+                single_player.pop(chat_id, None)
 
             send_message(
                 chat_id,
                 "🏠 منوی اصلی",
                 get_main_menu()
             )
-
             return
 
-
-        if text or media:
-
+        if content:
             finish_single_game(chat_id)
-
             return
 
 
-    # =================================================
-    # سؤال جدید تک نفره
-    # =================================================
+    # -------------------------------------------------
+    # دریافت سؤال آنلاین
+    # -------------------------------------------------
+
+    with room_lock:
+
+        code, room = find_player_room(chat_id)
+
+        if (
+            room
+            and room["phase"] == "waiting_question"
+            and room["questioner"] == chat_id
+        ):
+            question_code = code
+        else:
+            question_code = None
+
+    if question_code:
+
+        if not content:
+
+            send_message(
+                chat_id,
+                "⚠️ سؤال را به صورت متن، عکس یا ویس ارسال کن."
+            )
+            return
+
+        # جلوگیری از ثبت دکمه‌های منو به‌عنوان سؤال
+        if text and text.startswith(("🏠", "🚪", "🎮", "🤖")):
+            send_message(
+                chat_id,
+                "⚠️ اکنون باید سؤال یا چالش ارسال کنی."
+            )
+            return
+
+        with room_lock:
+
+            room = rooms.get(question_code)
+
+            if (
+                room
+                and room["phase"] == "waiting_question"
+                and room["questioner"] == chat_id
+            ):
+                room["question"] = content
+            else:
+                return
+
+        publish_question(question_code)
+        return
+
+
+    # -------------------------------------------------
+    # دریافت جواب آنلاین
+    # -------------------------------------------------
+
+    with room_lock:
+
+        code, room = find_player_room(chat_id)
+
+        if (
+            room
+            and room["phase"] == "waiting_answer"
+            and room["answerer"] == chat_id
+        ):
+            answer_code = code
+        else:
+            answer_code = None
+
+    if answer_code:
+
+        if not content:
+
+            send_message(
+                chat_id,
+                "⚠️ جواب را به صورت متن، عکس یا ویس ارسال کن."
+            )
+            return
+
+        if text and text.startswith(("🏠", "🚪", "🎮", "🤖")):
+            send_message(
+                chat_id,
+                "⚠️ اکنون باید پاسخ سؤال یا چالش را ارسال کنی."
+            )
+            return
+
+        with room_lock:
+
+            room = rooms.get(answer_code)
+
+            if (
+                room
+                and room["phase"] == "waiting_answer"
+                and room["answerer"] == chat_id
+            ):
+                room["answer"] = content
+            else:
+                return
+
+        publish_answer_and_start_vote(answer_code)
+        return
+
+
+    # -------------------------------------------------
+    # سؤال جدید تک‌نفره
+    # -------------------------------------------------
 
     if text == "⏭️ سؤال جدید":
 
         with state_lock:
-
             exists = chat_id in single_player
 
         if exists:
-
             start_single_game(chat_id)
 
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # منوی اصلی
-    # =================================================
+    # -------------------------------------------------
 
     if text == "🏠 منوی اصلی":
 
         with state_lock:
-
-            user_states.pop(
-                chat_id,
-                None
-            )
-
-            single_player.pop(
-                chat_id,
-                None
-            )
-
+            user_states.pop(chat_id, None)
+            single_player.pop(chat_id, None)
 
         send_message(
             chat_id,
             "🏠 منوی اصلی",
             get_main_menu()
         )
-
         return
 
 
-    # =================================================
-    # بازی تک نفره
-    # =================================================
+    # -------------------------------------------------
+    # بازی تک‌نفره
+    # -------------------------------------------------
 
     if text == "🤖 بازی تک‌نفره":
 
         with state_lock:
-
-            user_states[chat_id] = (
-                "choosing_single_mode"
-            )
-
+            user_states[chat_id] = "choosing_single_mode"
 
         send_message(
             chat_id,
             "🎮 حالت بازی را انتخاب کن:",
             get_modes_keyboard()
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # اتاق‌های آنلاین
-    # =================================================
+    # -------------------------------------------------
 
     if text == "🎮 اتاق‌های آنلاین":
 
@@ -2352,58 +1845,45 @@ def handle_message(message):
             "🎮 بخش بازی آنلاین",
             get_rooms_menu()
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # ساخت اتاق
-    # =================================================
+    # -------------------------------------------------
 
     if text == "🛠️ ساخت اتاق جدید":
 
-        code, room = find_player_room(
-            chat_id
-        )
+        with room_lock:
+            code, room = find_player_room(chat_id)
 
         if room:
 
             send_message(
                 chat_id,
-                (
-                    f"⚠️ شما در حال حاضر عضو اتاق "
-                    f"{code} هستید."
-                )
+                f"⚠️ شما عضو اتاق {code} هستید."
             )
-
             return
 
-
         with state_lock:
-
-            user_states[chat_id] = (
-                "choosing_room_mode"
-            )
-
+            user_states[chat_id] = "choosing_room_mode"
 
         send_message(
             chat_id,
             "🎮 حالت اتاق را انتخاب کن:",
             get_modes_keyboard()
         )
-
         return
 
 
-    # =================================================
-    # پیوستن به اتاق
-    # =================================================
+    # -------------------------------------------------
+    # پیوستن
+    # -------------------------------------------------
 
     if text == "🚪 پیوستن به اتاق":
 
-        code, room = find_player_room(
-            chat_id
-        )
+        with room_lock:
+            code, room = find_player_room(chat_id)
 
         if room:
 
@@ -2411,32 +1891,28 @@ def handle_message(message):
                 chat_id,
                 (
                     f"⚠️ شما عضو اتاق {code} هستید.\n"
-                    "برای ورود به اتاق دیگر ابتدا خارج شو."
+                    "ابتدا از اتاق خارج شو."
                 )
             )
-
             return
 
-
         list_rooms(chat_id)
-
         return
 
 
-    # =================================================
-    # خروج از اتاق
-    # =================================================
+    # -------------------------------------------------
+    # خروج
+    # -------------------------------------------------
 
     if text == "🚪 خروج از اتاق":
 
         leave_room(chat_id)
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # جدول امتیازات
-    # =================================================
+    # -------------------------------------------------
 
     if text == "🏆 جدول امتیازات":
 
@@ -2445,36 +1921,31 @@ def handle_message(message):
             get_leaderboard_text(),
             get_main_menu()
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # تغییر نام
-    # =================================================
+    # -------------------------------------------------
 
     if text == "✏️ تغییر نام":
 
         with state_lock:
-
             user_states[chat_id] = "change_name"
-
 
         send_message(
             chat_id,
             (
-                "✏️ نام جدید خود را ارسال کن.\n\n"
-                "⚠️ نام نباید قبلاً توسط کاربر دیگری "
-                "انتخاب شده باشد."
+                "✏️ نام جدید خود را به صورت متن ارسال کن.\n\n"
+                "⚠️ نام تکراری پذیرفته نمی‌شود."
             )
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # کانال
-    # =================================================
+    # -------------------------------------------------
 
     if text == "📢 کانال اطلاع‌رسانی":
 
@@ -2482,13 +1953,12 @@ def handle_message(message):
             chat_id,
             "📢 کانال اطلاع‌رسانی:\n@ettelae_resani"
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # پشتیبانی
-    # =================================================
+    # -------------------------------------------------
 
     if text == "💬 پشتیبانی":
 
@@ -2496,13 +1966,12 @@ def handle_message(message):
             chat_id,
             "💬 پشتیبانی:\n@kia_karfarma"
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # راهنما
-    # =================================================
+    # -------------------------------------------------
 
     if text == "📖 راهنمای بازی":
 
@@ -2510,195 +1979,28 @@ def handle_message(message):
             chat_id,
             (
                 "📖 راهنمای بازی\n\n"
-
-                "🤖 بازی تک‌نفره\n"
-                "سؤال یا چالش دریافت کن و پاسخ بده.\n"
-                "این بخش امتیازی ندارد.\n\n"
-
-                "🎮 بازی آنلاین\n"
+                "🤖 بازی تک‌نفره:\n"
+                "ربات به صورت شانسی سؤال یا چالش انتخاب می‌کند.\n"
+                "امتیازدهی ندارد.\n\n"
+                "🎮 بازی آنلاین:\n"
                 "یک اتاق بساز یا وارد اتاق دیگران شو.\n\n"
-
-                "🎯 پاسخ‌دهنده حقیقت یا جرئت انتخاب می‌کند.\n\n"
-
-                "✍️ پرسش‌کننده سؤال یا چالش را "
-                "به صورت متن، عکس یا ویس ارسال می‌کند.\n\n"
-
-                "💬 پاسخ‌دهنده نیز می‌تواند متن، "
-                "عکس یا ویس ارسال کند.\n\n"
-
-                "🗳️ سایر بازیکنان یک‌بار رأی می‌دهند.\n\n"
-
-                f"⏱️ رأی‌گیری {VOTE_TIMEOUT} ثانیه زمان دارد.\n\n"
-
-                "🏆 اگر رأی تأیید بیشتر باشد، "
-                "۱۰ امتیاز به پاسخ‌دهنده داده می‌شود."
+                "🎯 یک نفر حقیقت یا جرئت را انتخاب می‌کند.\n"
+                "✍️ پرسش‌کننده سؤال یا چالش را می‌فرستد.\n"
+                "💬 پاسخ‌دهنده جواب می‌دهد.\n\n"
+                "📩 هر دو نفر می‌توانند:\n"
+                "📝 متن\n"
+                "📷 عکس\n"
+                "🎤 ویس\n"
+                "ارسال کنند.\n\n"
+                "🗳️ سایر بازیکنان یک بار رأی می‌دهند.\n"
+                "⭐ در صورت تأیید اکثریت، ۱۰ امتیاز داده می‌شود."
             ),
             get_main_menu()
         )
-
         return
 
-
-    # =================================================
-    # دریافت سؤال آنلاین
-    # =================================================
-
-    with room_lock:
-
-        question_room_code = None
-
-        for code, room in rooms.items():
-
-            if (
-                room.get("phase") == "waiting_question"
-                and room.get("questioner") == chat_id
-            ):
-
-                question_room_code = code
-
-                break
-
-
-    if question_room_code:
-
-        if media:
-
-            with room_lock:
-
-                room = rooms.get(question_room_code)
-
-                if (
-                    room
-                    and room.get("phase") == "waiting_question"
-                    and room.get("questioner") == chat_id
-                ):
-
-                    room["question"] = media
-
-
-            send_online_question(
-                question_room_code
-            )
-
-            return
-
-
-        if text:
-
-            with room_lock:
-
-                room = rooms.get(question_room_code)
-
-                if (
-                    room
-                    and room.get("phase") == "waiting_question"
-                    and room.get("questioner") == chat_id
-                ):
-
-                    room["question"] = text[:2000]
-
-
-            send_online_question(
-                question_room_code
-            )
-
-            return
-
-
-        send_message(
-            chat_id,
-            (
-                "⚠️ سؤال یا چالش را به صورت "
-                "متن، عکس یا ویس ارسال کن."
-            )
-        )
-
-        return
-
-
-    # =================================================
-    # دریافت پاسخ آنلاین
-    # =================================================
-
-    with room_lock:
-
-        answer_room_code = None
-
-        for code, room in rooms.items():
-
-            if (
-                room.get("phase") == "waiting_answer"
-                and room.get("answerer") == chat_id
-            ):
-
-                answer_room_code = code
-
-                break
-
-
-    if answer_room_code:
-
-        if media:
-
-            with room_lock:
-
-                room = rooms.get(answer_room_code)
-
-                if (
-                    room
-                    and room.get("phase") == "waiting_answer"
-                    and room.get("answerer") == chat_id
-                ):
-
-                    room["answer"] = media
-
-
-            start_online_voting(
-                answer_room_code
-            )
-
-            return
-
-
-        if text:
-
-            with room_lock:
-
-                room = rooms.get(answer_room_code)
-
-                if (
-                    room
-                    and room.get("phase") == "waiting_answer"
-                    and room.get("answerer") == chat_id
-                ):
-
-                    room["answer"] = text[:2000]
-
-
-            start_online_voting(
-                answer_room_code
-            )
-
-            return
-
-
-        send_message(
-            chat_id,
-            (
-                "⚠️ پاسخ را به صورت متن، "
-                "عکس یا ویس ارسال کن."
-            )
-        )
-
-        return
-
-
-    # =================================================
-    # پیام پیش‌فرض
-    # =================================================
 
     if text:
-
         send_message(
             chat_id,
             "⚠️ لطفاً از دکمه‌های منو استفاده کن.",
@@ -2714,61 +2016,49 @@ def handle_callback(query):
 
     callback_id = query.get("id")
 
-    message = query.get(
-        "message",
-        {}
-    )
+    data = query.get("data", "")
 
-    chat = message.get(
-        "chat",
-        {}
-    )
+    sender = query.get("from", {})
 
-    chat_id = chat.get("id")
+    chat_id = sender.get("id")
 
-    data = query.get(
-        "data",
-        ""
-    )
+    if not chat_id:
 
+        chat_id = query.get(
+            "message",
+            {}
+        ).get(
+            "chat",
+            {}
+        ).get("id")
 
     if callback_id:
-
-        answer_callback(
-            callback_id
-        )
-
+        answer_callback(callback_id)
 
     if not chat_id or not data:
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # بازگشت
-    # =================================================
+    # -------------------------------------------------
 
     if data == "back_menu":
 
         with state_lock:
-
-            user_states.pop(
-                chat_id,
-                None
-            )
-
+            user_states.pop(chat_id, None)
 
         send_message(
             chat_id,
             "🏠 منوی اصلی",
             get_main_menu()
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # انتخاب حالت
-    # =================================================
+    # -------------------------------------------------
 
     if data.startswith("mode_"):
 
@@ -2778,358 +2068,189 @@ def handle_callback(query):
             1
         )
 
-
-        if mode not in [
-            "normal",
-            "fun",
-            "scary"
-        ]:
-
+        if mode not in PROMPTS:
             return
 
-
         with state_lock:
+            state = user_states.get(chat_id)
 
-            state = user_states.get(
-                chat_id
-            )
-
-
-        # بازی تک نفره
         if state == "choosing_single_mode":
 
             with state_lock:
 
-                user_states.pop(
-                    chat_id,
-                    None
-                )
+                user_states.pop(chat_id, None)
 
                 single_player[chat_id] = {
-
                     "mode": mode,
-
                     "waiting_answer": False
-
                 }
 
-
             start_single_game(chat_id)
-
             return
 
-
-        # ساخت اتاق
         if state == "choosing_room_mode":
 
             with state_lock:
+                user_states.pop(chat_id, None)
 
-                user_states.pop(
-                    chat_id,
-                    None
-                )
-
-
-            create_room(
-                chat_id,
-                mode
-            )
-
+            create_room(chat_id, mode)
             return
 
 
-    # =================================================
+    # -------------------------------------------------
     # پیوستن به اتاق
-    # =================================================
+    # -------------------------------------------------
 
-    if data.startswith("join_room_"):
+    if data.startswith("join_"):
 
-        code = data.replace(
-            "join_room_",
-            "",
-            1
-        )
-
+        code = data.replace("join_", "", 1)
 
         with room_lock:
 
             room = rooms.get(code)
 
-
             if not room:
-
                 status = "not_found"
 
-
-            elif room.get("phase") != "waiting":
-
+            elif room["phase"] != "waiting":
                 status = "started"
 
-
-            elif len(
-                room.get("players", [])
-            ) >= MAX_ROOM_PLAYERS:
-
+            elif len(room["players"]) >= MAX_ROOM_PLAYERS:
                 status = "full"
-
 
             else:
 
-                old_code, old_room = find_player_room(
-                    chat_id
-                )
-
+                old_code, old_room = find_player_room(chat_id)
 
                 if old_room and old_code != code:
-
                     status = "other_room"
 
-
                 else:
-
-                    status = "join"
-
+                    status = "success"
 
                     if chat_id not in room["players"]:
+                        room["players"].append(chat_id)
 
-                        room["players"].append(
-                            chat_id
-                        )
-
-                        joined = True
-
-                    else:
-
-                        joined = False
-
-
-                    players = list(
-                        room["players"]
-                    )
-
+                    players = list(room["players"])
 
         if status == "not_found":
-
-            send_message(
-                chat_id,
-                "❌ این اتاق دیگر وجود ندارد."
-            )
-
+            send_message(chat_id, "❌ این اتاق وجود ندارد.")
             return
-
 
         if status == "started":
-
-            send_message(
-                chat_id,
-                "❌ بازی این اتاق شروع شده است."
-            )
-
+            send_message(chat_id, "❌ بازی این اتاق شروع شده است.")
             return
-
 
         if status == "full":
-
-            send_message(
-                chat_id,
-                "❌ ظرفیت این اتاق تکمیل شده است."
-            )
-
+            send_message(chat_id, "❌ ظرفیت اتاق تکمیل شده است.")
             return
-
 
         if status == "other_room":
-
             send_message(
                 chat_id,
-                (
-                    "⚠️ شما عضو اتاق دیگری هستید.\n"
-                    "ابتدا از آن خارج شو."
-                )
+                "⚠️ ابتدا از اتاق فعلی خارج شو."
             )
-
             return
-
-
-        if joined:
-
-            for player in players:
-
-                if player != chat_id:
-
-                    send_message(
-                        player,
-                        (
-                            f"👤 {get_name(chat_id)} "
-                            "به اتاق پیوست."
-                        )
-                    )
-
 
         send_message(
             chat_id,
-            (
-                f"✅ به اتاق {code} پیوستی.\n"
-                "⏳ منتظر شروع بازی توسط میزبان باش."
-            ),
+            f"✅ وارد اتاق {code} شدی.",
             get_rooms_menu()
         )
 
-        return
+        for player in players:
 
+            if player != chat_id:
 
-    # =================================================
-    # شروع اتاق
-    # =================================================
-
-    if data.startswith("start_room_"):
-
-        code = data.replace(
-            "start_room_",
-            "",
-            1
-        )
-
-
-        with room_lock:
-
-            room = rooms.get(code)
-
-
-            if not room:
-
-                status = "not_found"
-
-
-            elif room.get("host") != chat_id:
-
-                status = "not_host"
-
-
-            elif len(
-                room.get("players", [])
-            ) < 2:
-
-                status = "not_enough"
-
-
-            elif room.get("phase") != "waiting":
-
-                status = "already_started"
-
-
-            else:
-
-                status = "success"
-
-
-        if status == "not_found":
-
-            send_message(
-                chat_id,
-                "❌ این اتاق وجود ندارد."
-            )
-
-            return
-
-
-        if status == "not_host":
-
-            send_message(
-                chat_id,
-                "⚠️ فقط میزبان می‌تواند بازی را شروع کند."
-            )
-
-            return
-
-
-        if status == "not_enough":
-
-            send_message(
-                chat_id,
-                "⚠️ برای شروع بازی حداقل ۲ بازیکن لازم است."
-            )
-
-            return
-
-
-        if status == "already_started":
-
-            send_message(
-                chat_id,
-                "⚠️ بازی قبلاً شروع شده است."
-            )
-
-            return
-
-
-        start_online_round(code)
-
-        return
-
-
-    # =================================================
-    # حذف اتاق
-    # =================================================
-
-    if data.startswith("delete_room_"):
-
-        code = data.replace(
-            "delete_room_",
-            "",
-            1
-        )
-
-
-        with room_lock:
-
-            room = rooms.get(code)
-
-
-            if not room:
-
-                status = "not_found"
-
-                players = []
-
-
-            elif room.get("host") != chat_id:
-
-                status = "not_host"
-
-                players = []
-
-
-            else:
-
-                status = "success"
-
-                players = list(
-                    room.get("players", [])
+                send_message(
+                    player,
+                    (
+                        f"👤 {get_name(chat_id)} "
+                        "به اتاق پیوست."
+                    )
                 )
 
-                del rooms[code]
+        return
 
 
-        if status == "not_found":
+    # -------------------------------------------------
+    # شروع بازی
+    # -------------------------------------------------
 
+    if data.startswith("start_"):
+
+        code = data.replace("start_", "", 1)
+
+        with room_lock:
+
+            room = rooms.get(code)
+
+            if not room:
+                status = "not_found"
+
+            elif room["host"] != chat_id:
+                status = "not_host"
+
+            elif len(room["players"]) < 2:
+                status = "not_enough"
+
+            elif room["phase"] != "waiting":
+                status = "started"
+
+            else:
+                status = "success"
+
+        messages = {
+            "not_found": "❌ اتاق وجود ندارد.",
+            "not_host": "⚠️ فقط میزبان می‌تواند بازی را شروع کند.",
+            "not_enough": "⚠️ حداقل ۲ بازیکن لازم است.",
+            "started": "⚠️ بازی قبلاً شروع شده است."
+        }
+
+        if status != "success":
             send_message(
                 chat_id,
-                "❌ این اتاق وجود ندارد."
+                messages[status]
             )
-
             return
 
+        start_online_round(code)
+        return
+
+
+    # -------------------------------------------------
+    # حذف اتاق
+    # -------------------------------------------------
+
+    if data.startswith("delete_"):
+
+        code = data.replace("delete_", "", 1)
+
+        with room_lock:
+
+            room = rooms.get(code)
+
+            if not room:
+                status = "not_found"
+
+            elif room["host"] != chat_id:
+                status = "not_host"
+
+            else:
+                status = "success"
+                players = list(room["players"])
+                del rooms[code]
+
+        if status == "not_found":
+            send_message(chat_id, "❌ اتاق وجود ندارد.")
+            return
 
         if status == "not_host":
-
             send_message(
                 chat_id,
                 "⚠️ فقط میزبان می‌تواند اتاق را حذف کند."
             )
-
             return
-
 
         for player in players:
 
@@ -3142,100 +2263,63 @@ def handle_callback(query):
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # حقیقت یا جرئت
-    # =================================================
+    # -------------------------------------------------
 
     if (
         data.startswith("truth_")
         or data.startswith("dare_")
     ):
 
-        try:
-
-            choice, code = data.split(
-                "_",
-                1
-            )
-
-        except ValueError:
-
-            return
-
+        choice, code = data.split("_", 1)
 
         with room_lock:
 
             room = rooms.get(code)
 
-
             if not room:
-
                 status = "not_found"
 
-
-            elif room.get("phase") != "choosing_type":
-
+            elif room["phase"] != "choosing_type":
                 status = "wrong_phase"
 
-
-            elif room.get("answerer") != chat_id:
-
+            elif room["answerer"] != chat_id:
                 status = "not_answerer"
-
 
             else:
 
                 status = "success"
 
                 room["question_type"] = choice
-
                 room["phase"] = "waiting_question"
 
                 questioner = room["questioner"]
-
-                players = list(
-                    room["players"]
-                )
-
+                players = list(room["players"])
 
         if status == "not_found":
-
-            send_message(
-                chat_id,
-                "❌ این اتاق وجود ندارد."
-            )
-
+            send_message(chat_id, "❌ اتاق وجود ندارد.")
             return
-
 
         if status == "wrong_phase":
-
             send_message(
                 chat_id,
-                "⚠️ انتخاب این دور قبلاً انجام شده است."
+                "⚠️ این انتخاب قبلاً انجام شده است."
             )
-
             return
 
-
         if status == "not_answerer":
-
             send_message(
                 chat_id,
                 "⚠️ فقط پاسخ‌دهنده می‌تواند انتخاب کند."
             )
-
             return
 
-
-        if choice == "truth":
-
-            choice_text = "🎯 حقیقت"
-
-        else:
-
-            choice_text = "🔥 جرئت"
-
+        choice_text = (
+            "🎯 حقیقت"
+            if choice == "truth"
+            else "🔥 جرئت"
+        )
 
         for player in players:
 
@@ -3244,10 +2328,9 @@ def handle_callback(query):
                 send_message(
                     player,
                     (
-                        f"✅ پاسخ‌دهنده انتخاب کرد: "
-                        f"{choice_text}\n\n"
-                        "✍️ حالا سؤال یا چالش مناسب را "
-                        "به صورت متن، عکس یا ویس ارسال کن."
+                        f"✅ انتخاب پاسخ‌دهنده: {choice_text}\n\n"
+                        "✍️ حالا سؤال یا چالش خودت را ارسال کن.\n\n"
+                        "می‌توانی 📝 متن، 📷 عکس یا 🎤 ویس بفرستی."
                     )
                 )
 
@@ -3264,50 +2347,40 @@ def handle_callback(query):
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # رأی مثبت
-    # =================================================
+    # -------------------------------------------------
 
     if data.startswith("yes_"):
 
-        code = data.replace(
-            "yes_",
-            "",
-            1
-        )
+        code = data.replace("yes_", "", 1)
 
         register_vote(
             code,
             chat_id,
             "yes"
         )
-
         return
 
 
-    # =================================================
+    # -------------------------------------------------
     # رأی منفی
-    # =================================================
+    # -------------------------------------------------
 
     if data.startswith("no_"):
 
-        code = data.replace(
-            "no_",
-            "",
-            1
-        )
+        code = data.replace("no_", "", 1)
 
         register_vote(
             code,
             chat_id,
             "no"
         )
-
         return
 
 
 # =====================================================
-# پردازش Update
+# Update Handler
 # =====================================================
 
 def handle_update(update):
@@ -3320,20 +2393,15 @@ def handle_update(update):
                 update["message"]
             )
 
-
         elif "callback_query" in update:
 
             handle_callback(
                 update["callback_query"]
             )
 
-
     except Exception as error:
 
-        print(
-            "❌ Update Error:",
-            error
-        )
+        print("❌ Update Error:", error)
 
 
 # =====================================================
@@ -3342,7 +2410,7 @@ def handle_update(update):
 
 def run_polling():
 
-    offset = 0
+    offset = None
 
     print("🤖 Polling started")
 
@@ -3350,18 +2418,20 @@ def run_polling():
 
         try:
 
+            params = {
+                "timeout": 30
+            }
+
+            if offset is not None:
+                params["offset"] = offset
+
             response = requests.get(
                 f"{BASE_URL}/getUpdates",
-                params={
-                    "offset": offset,
-                    "timeout": 30
-                },
+                params=params,
                 timeout=40
             )
 
-
             data = response.json()
-
 
             if not data.get("ok"):
 
@@ -3371,48 +2441,31 @@ def run_polling():
                 )
 
                 time.sleep(3)
-
                 continue
 
-
-            updates = data.get(
-                "result",
-                []
-            )
-
+            updates = data.get("result", [])
 
             for update in updates:
 
-                update_id = update.get(
-                    "update_id"
-                )
-
+                update_id = update.get("update_id")
 
                 if update_id is not None:
-
                     offset = update_id + 1
-
 
                 handle_update(update)
 
-
         except requests.exceptions.Timeout:
-
             continue
-
 
         except Exception as error:
 
-            print(
-                "❌ Polling Error:",
-                error
-            )
+            print("❌ Polling Error:", error)
 
             time.sleep(5)
 
 
 # =====================================================
-# اجرای اصلی
+# اجرای ربات
 # =====================================================
 
 if __name__ == "__main__":
@@ -3421,14 +2474,12 @@ if __name__ == "__main__":
 
     init_database()
 
-
     polling_thread = threading.Thread(
         target=run_polling,
         daemon=True
     )
 
     polling_thread.start()
-
 
     app.run(
         host="0.0.0.0",
