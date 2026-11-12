@@ -2742,17 +2742,14 @@ def handle_update(update):
 # =====================================================
 # Polling
 # =====================================================
-
 def run_polling():
-
     offset = None
 
     print("🤖 Polling started")
+    print("📡 Requesting updates from Bale API...")
 
     while True:
-
         try:
-
             params = {
                 "timeout": 20
             }
@@ -2766,40 +2763,25 @@ def run_polling():
                 timeout=30
             )
 
+            print(f"📡 HTTP Status: {response.status_code}")
+            print(f"📡 API Response: {response.text}")
+
             if response.status_code != 200:
-
-                print(
-                    "❌ HTTP Error:",
-                    response.status_code
-                )
-
+                print(f"❌ HTTP Error: {response.status_code}")
                 time.sleep(3)
                 continue
 
-            try:
-                data = response.json()
-
-            except Exception as error:
-
-                print(
-                    "❌ JSON Error:",
-                    repr(error)
-                )
-
-                time.sleep(3)
-                continue
+            data = response.json()
 
             if not data.get("ok", False):
-
-                print(
-                    "❌ getUpdates API Error:",
-                    data
-                )
-
+                print(f"❌ getUpdates API Error: {data}")
                 time.sleep(3)
                 continue
 
             updates = data.get("result", [])
+
+            if updates:
+                print(f"📨 Received {len(updates)} update(s)")
 
             for update in updates:
 
@@ -2808,22 +2790,16 @@ def run_polling():
                 if update_id is not None:
                     offset = update_id + 1
 
+                print(f"📨 Processing update: {update}")
+
                 handle_update(update)
 
         except requests.exceptions.Timeout:
-
             print("⏳ Request timeout")
 
         except Exception as error:
-
-            print(
-                "❌ Polling Error:",
-                repr(error)
-            )
-
+            print(f"❌ Polling Error: {repr(error)}")
             time.sleep(5)
-
-
 # =====================================================
 # اجرای ربات
 # =====================================================
